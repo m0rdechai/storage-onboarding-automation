@@ -1,0 +1,13 @@
+# Run-specific output (regenerated each execution)
+logs/
+results/
+
+# QUADS API cache
+cloud*.json
+
+# Environment files (contain allocation-specific config)
+# Copy env/example.env and edit for your cloud.
+env/cloud*.env
+
+# Scratch / one-off notes
+request.md
