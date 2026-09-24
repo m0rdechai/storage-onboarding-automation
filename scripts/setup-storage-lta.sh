@@ -176,7 +176,7 @@ The env file must set at minimum:
   CLOUD_ID=6
   STORAGE_ARRAYS="ibm pure"
 
-See env/cloud06.env for a full example.
+See env/example.env for a full example.
 EOF
     exit 0
 }

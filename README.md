@@ -19,7 +19,7 @@ When a new cloud is allocated in the ScaleLab, its worker nodes need VLAN sub-in
 
 ```bash
 # 1. Edit or copy an env file for your cloud
-cp env/cloud06.env env/cloud<NN>.env
+cp env/example.env env/cloud<NN>.env
 vi env/cloud<NN>.env   # set CLOUD_ID and STORAGE_ARRAYS
 
 # 2. Preview what will happen (dry-run)
@@ -95,7 +95,7 @@ LUN_COUNT=1             # number of volumes/LUNs per vendor
 EXCLUDE_HOSTS=""        # space-separated hostnames to skip
 ```
 
-See `env/cloud06.env` for a fully commented example.
+See `env/example.env` for a fully commented template.
 
 ## Credentials
 
@@ -129,7 +129,7 @@ storage-onboarding-automation/
     setup-storage-lta.sh         # main script
     storage-lta-subnet-calc.sh   # standalone VLAN/subnet calculator
   env/
-    cloud06.env                  # per-cloud configuration files
+    example.env                  # template — copy for your cloud
     cloud20.env
   results/                       # generated CSVs, Jira drafts
   logs/                          # per-run timestamped logs
