@@ -1104,17 +1104,27 @@ do_host_setup() {
 # BWS credential helpers (Bitwarden Secrets Manager CLI)
 # =============================================================================
 _BWS_CACHE=""
+bws_load_cache() {
+    if ! command -v bws &>/dev/null; then
+        log_error "bws CLI not found. Install Bitwarden Secrets Manager CLI."
+        return 1
+    fi
+    # Keep only storage credentials in the cache; set BWS_PROJECT_ID to
+    # scope the list call to a dedicated project.
+    local -a bws_list=(bws secret list -o json)
+    if [[ -n "${BWS_PROJECT_ID:-}" ]]; then
+        bws_list+=("${BWS_PROJECT_ID}")
+    fi
+    _BWS_CACHE=$("${bws_list[@]}" 2>/dev/null \
+        | jq '[.[] | select(.key | startswith("STORAGE_"))]') || {
+        log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
+        return 1
+    }
+}
 bws_get() {
     local key="$1"
     if [[ -z "$_BWS_CACHE" ]]; then
-        if ! command -v bws &>/dev/null; then
-            log_error "bws CLI not found. Install Bitwarden Secrets Manager CLI."
-            return 1
-        fi
-        _BWS_CACHE=$(bws secret list -o json 2>/dev/null) || {
-            log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
-            return 1
-        }
+        bws_load_cache || return 1
     fi
     echo "$_BWS_CACHE" | jq -r --arg k "$key" '.[] | select(.key == $k) | .value'
 }
@@ -2225,11 +2235,8 @@ do_storage_setup() {
 
     # Pre-populate bws credential cache so $() subshells inherit it
     if [[ "$DRY_RUN" != "true" ]]; then
-        _BWS_CACHE=$(bws secret list -o json 2>/dev/null) || {
-            log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
-            return 1
-        }
-        log "Credential cache loaded (${#_BWS_CACHE} bytes)"
+        bws_load_cache || return 1
+        log "Credential cache loaded (${#_BWS_CACHE} bytes, storage credentials only)"
     fi
 
     local cloud_name="cloud$(printf '%02d' "$CLOUD_ID")"

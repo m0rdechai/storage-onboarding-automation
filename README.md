@@ -110,7 +110,7 @@ Secret keys used:
 | `STORAGE_NETAPP_AFF_MGMT_IP` / `_USER` / `_MGMT_PW` | NetApp A300 SSH access |
 | `STORAGE_PURE_MGMT_IP` / `_USER` / `_PW` | Pure FlashArray SSH access |
 
-Credentials are cached in-memory for the duration of a single run (one `bws secret list` call) and are never written to disk.
+Credentials are cached in-memory for the duration of a single run (one `bws secret list` call, filtered to `STORAGE_*` keys — non-storage secrets in the BWS project are never retained) and are never written to disk. Optionally set `BWS_PROJECT_ID` to scope the list call to a dedicated storage-credentials project.
 
 ## Prerequisites
 
