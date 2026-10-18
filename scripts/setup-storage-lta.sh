@@ -1986,9 +1986,9 @@ storage_setup_netapp_a300() {
             log_success "  LUN ${lun_name} already exists"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux"
+                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled"
             else
-                storage_ssh netapp-a300 "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux" 2>/dev/null || {
+                storage_ssh netapp-a300 "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled" 2>/dev/null || {
                     log_error "  Failed to create LUN ${lun_name}"
                     continue
                 }
