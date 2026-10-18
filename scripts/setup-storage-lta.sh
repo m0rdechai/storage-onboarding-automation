@@ -596,12 +596,18 @@ generate_nncp_yaml() {
     local profile="vlan${vlan_id}"
     local vendor_name="${PLATFORM_NAMES[$vendor]:-$vendor}"
 
+    # Per-node NNCPs need unique names; include hostname when targeting a specific node
+    local nncp_name="${cloud_name}-${profile}-storage-lta"
+    if [[ "$node_selector_key" == "kubernetes.io/hostname" ]]; then
+        nncp_name="${cloud_name}-${node_selector_value}-${profile}-storage-lta"
+    fi
+
     cat <<EOF
 ---
 apiVersion: nmstate.io/v1
 kind: NodeNetworkConfigurationPolicy
 metadata:
-  name: ${cloud_name}-${profile}-storage-lta
+  name: ${nncp_name}
   labels:
     storage-lta/cloud: "${cloud_name}"
     storage-lta/vendor: "${vendor}"
