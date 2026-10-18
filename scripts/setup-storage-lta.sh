@@ -2090,15 +2090,19 @@ storage_discovery_and_verify() {
     log ""
     log "--- Sub-stage E: iSCSI discovery + login + verification ---"
 
-    # Collect portal IPs per vendor (the .2 address from each VLAN)
+    # Collect portal IPs per vendor (.2 and .3 for dual-controller arrays like IBM)
     declare -A vendor_portals
     while read -r _nic vlan_id subnet_base vendor path; do
-        local portal_ip="${subnet_base}.2"
-        if [[ -n "${vendor_portals[$vendor]:-}" ]]; then
-            vendor_portals[$vendor]+=" ${portal_ip}"
-        else
-            vendor_portals[$vendor]="$portal_ip"
-        fi
+        for last_octet in 2 3; do
+            local portal_ip="${subnet_base}.${last_octet}"
+            if [[ -n "${vendor_portals[$vendor]:-}" ]]; then
+                # Avoid duplicates (same IP from different layout entries)
+                [[ " ${vendor_portals[$vendor]} " == *" ${portal_ip} "* ]] && continue
+                vendor_portals[$vendor]+=" ${portal_ip}"
+            else
+                vendor_portals[$vendor]="$portal_ip"
+            fi
+        done
     done < <(compute_vlan_layout)
 
     # Get OCP worker list
