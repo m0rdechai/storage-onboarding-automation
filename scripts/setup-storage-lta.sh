@@ -1279,7 +1279,7 @@ storage_setup_netapp_asa() {
         log "  LIF status:"
         echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
             log "    $line"
-        done
+        done || true
     else
         log "  Creating IPspace, broadcast domains, VLAN ports, SVM, and LIFs..."
 
@@ -1876,7 +1876,7 @@ storage_setup_netapp_a300() {
         log "  LIF status:"
         echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
             log "    $line"
-        done
+        done || true
     else
         log "  Creating IPspace, broadcast domains, VLAN ports, SVM, iSCSI service, and LIFs..."
 
