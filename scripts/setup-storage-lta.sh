@@ -1964,11 +1964,15 @@ storage_setup_netapp_a300() {
         vol_check=$(storage_ssh netapp-a300 "volume show -vserver ${svm} -volume ${vol_name} -fields volume" 2>/dev/null | grep -c "${vol_name}" || true)
         if [[ "$vol_check" -gt 0 ]]; then
             log_success "  Volume ${vol_name} already exists"
+            # Ensure snapshot reserve is 0 for LUN volumes (may have been created with default 5%)
+            if [[ "$DRY_RUN" != "true" ]]; then
+                storage_ssh netapp-a300 "volume modify -vserver ${svm} -volume ${vol_name} -percent-snapshot-space 0" 2>/dev/null || true
+            fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create volume: volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none"
+                log "[DRY-RUN] Would create volume: volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0"
             else
-                storage_ssh netapp-a300 "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none" 2>/dev/null || {
+                storage_ssh netapp-a300 "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0" 2>/dev/null || {
                     log_error "  Failed to create volume ${vol_name}"
                     continue
                 }
