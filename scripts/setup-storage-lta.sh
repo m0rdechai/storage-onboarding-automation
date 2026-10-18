@@ -1781,6 +1781,15 @@ storage_setup_ibm() {
         host_check=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | grep -c "${host_name}" || true)
         if [[ "$host_check" -gt 0 ]]; then
             log_success "  Host ${host_name} already exists"
+            # Ensure host is in the correct portset (may differ if created by a prior run)
+            if [[ "$DRY_RUN" != "true" ]]; then
+                local cur_portset
+                cur_portset=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | awk '/^portset_name /{print $2}')
+                if [[ "$cur_portset" != "${portset_name}" ]]; then
+                    storage_ssh ibm "svctask chhost -portset ${portset_name} ${host_name}" 2>/dev/null || true
+                    log "    Moved ${host_name} from portset '${cur_portset}' → '${portset_name}'"
+                fi
+            fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create: svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}"
