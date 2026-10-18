@@ -13,7 +13,7 @@ When a new cloud is allocated in the ScaleLab, its worker nodes need VLAN sub-in
 | `netapp-asa` | NetApp ASA A70 | SSH (ONTAP CLI, flat LUN namespace) |
 | `pure` | Pure FlashArray X70R5 | SSH (Purity CLI) |
 | `ibm` | IBM FlashSystem 7300 | SSH (SVC CLI — `svctask`/`svcinfo`) |
-| `netapp-a300` | NetApp AFF A300 | SSH (standard ONTAP CLI with volumes) |
+| `netapp-aff` | NetApp AFF A300 | SSH (standard ONTAP CLI with volumes) |
 
 ## Quick Start
 
