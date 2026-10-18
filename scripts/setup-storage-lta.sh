@@ -1672,9 +1672,9 @@ storage_setup_ibm() {
         log_success "  Portset ${portset_name} already exists"
     else
         if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create portset: svctask mkportset -type host ${portset_name}"
+            log "[DRY-RUN] Would create portset: svctask mkportset -name ${portset_name} -type host"
         else
-            storage_ssh ibm "svctask mkportset -type host ${portset_name}" 2>/dev/null || {
+            storage_ssh ibm "svctask mkportset -name ${portset_name} -type host" 2>/dev/null || {
                 log_error "  Failed to create portset ${portset_name}"
                 return 1
             }
@@ -1712,9 +1712,9 @@ storage_setup_ibm() {
             log_success "  IP ${ip} already configured on ${node}:port${port}"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: svctask mkip -node ${node} -port ${port} -ip ${ip} -mask 255.255.255.0 -vlan ${vlan}"
+                log "[DRY-RUN] Would create: svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}"
             else
-                storage_ssh ibm "svctask mkip -node ${node} -port ${port} -ip ${ip} -mask 255.255.255.0 -vlan ${vlan}" 2>/dev/null || {
+                storage_ssh ibm "svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}" 2>/dev/null || {
                     log_error "  Failed to create IP ${ip} on ${node}:port${port}"
                     continue
                 }
@@ -1805,9 +1805,9 @@ storage_setup_ibm() {
                 log_success "  vdisk ${vdisk_name} already mapped to ${host_name}"
             else
                 if [[ "$DRY_RUN" == "true" ]]; then
-                    log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -scsi ${scsi_id} ${vdisk_name}"
+                    log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}"
                 else
-                    storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -scsi ${scsi_id} ${vdisk_name}" 2>/dev/null || {
+                    storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}" 2>/dev/null || {
                         log_error "  Failed to map ${vdisk_name} to ${host_name}"
                         continue
                     }
