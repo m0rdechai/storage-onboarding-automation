@@ -143,8 +143,8 @@ MULTIPATH_NETAPP='devices {
 # =============================================================================
 # Logging
 # =============================================================================
-log()         { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; [[ -n "${LOG_FILE:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
-log_verbose() { [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"; }
+log()         { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; if [[ -n "${LOG_FILE:-}" ]]; then echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; fi; }
+log_verbose() { if [[ "$VERBOSE" == "true" ]]; then log "[VERBOSE] $*"; fi; }
 log_error()   { log "[ERROR] $*"; }
 log_success() { log "[OK] $*"; }
 log_warn()    { log "[WARN] $*"; }
@@ -1166,7 +1166,10 @@ storage_ssh() {
     fi
 
     log_verbose "  storage_ssh ${vendor} (${host}): $*"
-    sshpass -p "$pw" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 "${user}@${host}" "$@"
+    # PubkeyAuthentication=no: arrays authenticate via password only; a local
+    # ssh-agent key the array doesn't know makes some arrays (IBM Storage
+    # Virtualize: CMMVC7016E) abort the connection instead of falling back.
+    sshpass -p "$pw" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o PubkeyAuthentication=no "${user}@${host}" "$@"
 }
 
 # =============================================================================
@@ -1217,7 +1220,11 @@ collect_worker_iqns() {
         done
     fi
 
-    printf '%s\n' "${iqns[@]}"
+    # Guard: printf '%s\n' with an empty array still emits one blank line,
+    # which mapfile would turn into a phantom empty "worker:iqn" pair.
+    if (( ${#iqns[@]} > 0 )); then
+        printf '%s\n' "${iqns[@]}"
+    fi
 }
 
 # =============================================================================
@@ -1957,31 +1964,64 @@ storage_setup_netapp_aff() {
             log_success "  IPspace ${ipspace} created"
         fi
 
-        # Step 2: Broadcast domains
+        # Step 2: Broadcast domains (checked independently — no duplicate-entry noise on re-runs)
         local bd_a="bd_${cloud_name}_a"
         local bd_b="bd_${cloud_name}_b"
-        storage_ssh netapp-aff "network port broadcast-domain create -broadcast-domain ${bd_a} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
-        storage_ssh netapp-aff "network port broadcast-domain create -broadcast-domain ${bd_b} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
-
-        # Step 3: VLAN ports
-        for node in "$node1" "$node2"; do
-            storage_ssh netapp-aff "network port vlan create -node ${node} -vlan-name ${port_a}-${vlanA}" 2>/dev/null || true
-            storage_ssh netapp-aff "network port vlan create -node ${node} -vlan-name ${port_b}-${vlanB}" 2>/dev/null || true
+        local bd
+        for bd in "$bd_a" "$bd_b"; do
+            local bd_check
+            bd_check=$(storage_ssh netapp-aff "network port broadcast-domain show -broadcast-domain ${bd}" 2>/dev/null | grep -c "${bd}" || true)
+            if [[ "$bd_check" -gt 0 ]]; then
+                log_success "  Broadcast domain ${bd} already exists"
+            else
+                storage_ssh netapp-aff "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || log_warn "  Broadcast domain ${bd} creation failed"
+                log_success "  Broadcast domain ${bd} created"
+            fi
         done
 
-        # Handle auto-assigned broadcast domains
+        # Step 3: VLAN ports + broadcast-domain membership (reconciled on every run;
+        # one port query drives create-if-missing, remove-from-wrong-domain, add-to-target)
+        local -a add_a=() add_b=()
+        local node vp cur_bd target_bd
         for node in "$node1" "$node2"; do
             for vp in "${port_a}-${vlanA}" "${port_b}-${vlanB}"; do
-                local auto_bd
-                auto_bd=$(storage_ssh netapp-aff "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
-                if [[ -n "$auto_bd" && "$auto_bd" != "-" && "$auto_bd" != "${bd_a}" && "$auto_bd" != "${bd_b}" ]]; then
-                    storage_ssh netapp-aff "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${auto_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                if [[ "$vp" == "${port_b}-${vlanB}" ]]; then
+                    target_bd="$bd_b"
+                else
+                    target_bd="$bd_a"
+                fi
+                cur_bd=$(storage_ssh netapp-aff "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
+                if [[ -z "$cur_bd" ]]; then
+                    # VLAN port doesn't exist yet — create it (auto-assigned to a Default-ipspace domain)
+                    storage_ssh netapp-aff "network port vlan create -node ${node} -vlan-name ${vp}" 2>/dev/null || log_warn "  VLAN port ${node}:${vp} creation failed"
+                    log_success "  VLAN port ${node}:${vp} created"
+                elif [[ "$cur_bd" == "$target_bd" ]]; then
+                    log_verbose "  ${node}:${vp} already in ${target_bd}"
+                    continue
+                elif [[ "$cur_bd" != "-" ]]; then
+                    log "  Moving ${node}:${vp} from ${cur_bd} to ${target_bd}"
+                    storage_ssh netapp-aff "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                fi
+                if [[ "$target_bd" == "$bd_a" ]]; then
+                    add_a+=("${node}:${vp}")
+                else
+                    add_b+=("${node}:${vp}")
                 fi
             done
         done
 
-        storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports ${node1}:${port_a}-${vlanA},${node2}:${port_a}-${vlanA}" 2>/dev/null || true
-        storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports ${node1}:${port_b}-${vlanB},${node2}:${port_b}-${vlanB}" 2>/dev/null || true
+        if (( ${#add_a[@]} > 0 )); then
+            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_a}"
+            log_success "  Ports added to ${bd_a}"
+        else
+            log_success "  Path-A ports already homed in ${bd_a}"
+        fi
+        if (( ${#add_b[@]} > 0 )); then
+            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_b}"
+            log_success "  Ports added to ${bd_b}"
+        else
+            log_success "  Path-B ports already homed in ${bd_b}"
+        fi
 
         # Step 4: SVM
         local svm_exists
