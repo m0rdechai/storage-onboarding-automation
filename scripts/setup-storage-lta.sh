@@ -1860,9 +1860,9 @@ storage_setup_netapp_a300() {
     # Nodes on the A300
     local node1="b02-h37-ntap-a300-01"
     local node2="b02-h37-ntap-a300-02"
-    # Data ports — need to confirm from the array; use e0e/e0f as likely candidates
-    local port_a="e0e"
-    local port_b="e0f"
+    # Data ports — e0g and e0h are the 10GbE data ports on this A300
+    local port_a="e0g"
+    local port_b="e0h"
 
     # --- Sub-stage A: verify or create IPspace, SVM, LIFs ---
     log "  [A] Checking IPspace, SVM, iSCSI service, and LIFs..."
