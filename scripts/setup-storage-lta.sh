@@ -1527,7 +1527,7 @@ pure_object_state() {
         return 1
     fi
     local rc=0
-    PURE_CLI_OUT=$(storage_ssh pure "$cmd" 2>&1) || rc=$?
+    PURE_CLI_OUT=$(storage_ssh pure "$cmd") || rc=$?
     if [[ $rc -eq 0 ]]; then
         return 0
     fi
@@ -1561,7 +1561,7 @@ pure_ensure() {
         return 0
     fi
     local rc=0
-    PURE_CLI_OUT=$(storage_ssh pure "$create_cmd" 2>&1) || rc=$?
+    PURE_CLI_OUT=$(storage_ssh pure "$create_cmd") || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to create ${what}"
         log "    command: ${create_cmd}"
@@ -1576,9 +1576,12 @@ pure_ensure() {
 # Enable a Pure vif when the array created it disabled.
 pure_enable_if_needed() {
     local iface="$1"
-    [[ "$DRY_RUN" == "true" ]] && return 0
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would run: purenetwork eth enable ${iface} (if the vif is disabled)"
+        return 0
+    fi
     local rc=0 out
-    out=$(storage_ssh pure "purenetwork eth list ${iface} --nvp" 2>&1) || rc=$?
+    out=$(storage_ssh pure "purenetwork eth list ${iface} --nvp") || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to read interface ${iface}"
         log "    command: purenetwork eth list ${iface} --nvp"
@@ -1589,7 +1592,7 @@ pure_enable_if_needed() {
         return 0
     fi
     rc=0
-    out=$(storage_ssh pure "purenetwork eth enable ${iface}" 2>&1) || rc=$?
+    out=$(storage_ssh pure "purenetwork eth enable ${iface}") || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to enable interface ${iface}"
         log "    command: purenetwork eth enable ${iface}"
@@ -1721,7 +1724,7 @@ storage_setup_pure() {
         fi
 
         local member_out member_rc=0
-        member_out=$(storage_ssh pure "purehost list ${host_name} --csv" 2>&1) || member_rc=$?
+        member_out=$(storage_ssh pure "purehost list ${host_name} --csv") || member_rc=$?
         if [[ $member_rc -ne 0 ]]; then
             log_error "  Failed to read host group membership for ${host_name}"
             log "    command: purehost list ${host_name} --csv"
@@ -1735,7 +1738,7 @@ storage_setup_pure() {
         fi
 
         member_rc=0
-        member_out=$(storage_ssh pure "$member_cmd" 2>&1) || member_rc=$?
+        member_out=$(storage_ssh pure "$member_cmd") || member_rc=$?
         if [[ $member_rc -ne 0 ]]; then
             log_error "  Failed to add ${host_name} to ${hg_name}"
             log "    command: ${member_cmd}"
@@ -1760,7 +1763,7 @@ storage_setup_pure() {
         fi
 
         local map_out map_rc=0
-        map_out=$(storage_ssh pure "purevol list ${vol_name} --connect" 2>&1) || map_rc=$?
+        map_out=$(storage_ssh pure "purevol list ${vol_name} --connect") || map_rc=$?
         if [[ $map_rc -ne 0 && "$map_out" != *"does not exist"* ]]; then
             log_error "  Failed to query mapping for ${vol_name}"
             log "    command: purevol list ${vol_name} --connect"
@@ -1774,7 +1777,7 @@ storage_setup_pure() {
         fi
 
         map_rc=0
-        map_out=$(storage_ssh pure "$map_cmd" 2>&1) || map_rc=$?
+        map_out=$(storage_ssh pure "$map_cmd") || map_rc=$?
         if [[ $map_rc -ne 0 ]]; then
             log_error "  Failed to map volume ${vol_name} to ${hg_name}"
             log "    command: ${map_cmd}"
@@ -1801,7 +1804,7 @@ storage_setup_pure() {
         local subnet_name="${cloud_name}-pure-path${pth}"
         verify_cmd="puresubnet list ${subnet_name}"
         verify_rc=0
-        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+        verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
         pure_log_lines "$verify_out"
         if [[ $verify_rc -ne 0 ]]; then
             log_error "  Verify failed: ${verify_cmd}"
@@ -1812,7 +1815,7 @@ storage_setup_pure() {
             local iface="ct${ct_idx}.eth14.${vid}"
             verify_cmd="purenetwork eth list ${iface} --nvp"
             verify_rc=0
-            verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+            verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
             pure_log_lines "$verify_out"
             if [[ $verify_rc -ne 0 || "$verify_out" == *"Enabled=False"* ]]; then
                 log_error "  Verify failed: ${iface} is missing or disabled"
@@ -1823,7 +1826,7 @@ storage_setup_pure() {
 
     verify_cmd="purehgroup list ${hg_name}"
     verify_rc=0
-    verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+    verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
     pure_log_lines "$verify_out"
     if [[ $verify_rc -ne 0 ]]; then
         log_error "  Verify failed: ${verify_cmd}"
@@ -1835,7 +1838,7 @@ storage_setup_pure() {
         vol_name=$(printf "${cloud_name}_iscsi_lta_pure_vol%02d" "$i")
         verify_cmd="purevol list ${vol_name} --connect"
         verify_rc=0
-        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+        verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
         pure_log_lines "$verify_out"
         if [[ $verify_rc -ne 0 ]] || ! grep -Fq "${hg_name}" <<< "$verify_out"; then
             log_error "  Verify failed: ${vol_name} is not connected to ${hg_name}"
@@ -2492,13 +2495,15 @@ do_storage_setup() {
     local -a vendors_arr
     read -r -a vendors_arr <<< "$STORAGE_ARRAYS"
 
-    # Run per-vendor storage setup
+    # A vendor returning non-zero must not abort the shell: later vendors
+    # and discovery still run, and the stage exits non-zero at the end.
+    local setup_failed=0
     for vendor in "${vendors_arr[@]}"; do
         case "$vendor" in
-            netapp-asa)  storage_setup_netapp_asa  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
-            pure)        storage_setup_pure         "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
-            ibm)         storage_setup_ibm          "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
-            netapp-aff) storage_setup_netapp_aff  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
+            netapp-asa)  storage_setup_netapp_asa  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
+            pure)        storage_setup_pure         "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
+            ibm)         storage_setup_ibm          "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
+            netapp-aff)  storage_setup_netapp_aff  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
             *)           log_warn "Unknown vendor '${vendor}' — skipping storage-setup" ;;
         esac
     done
@@ -2507,6 +2512,10 @@ do_storage_setup() {
     storage_discovery_and_verify "$cloud_name" "${vendors_arr[@]}"
 
     log ""
+    if [[ "$setup_failed" -ne 0 ]]; then
+        log_error "=== storage-setup incomplete ==="
+        return 1
+    fi
     log_success "=== storage-setup complete ==="
 }
 
