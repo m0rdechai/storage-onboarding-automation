@@ -1508,8 +1508,103 @@ storage_setup_netapp_asa() {
     log_success "  NetApp ASA storage-setup complete for ${cloud_name}"
 }
 
+# Log each line of a Pure CLI response under the current stage.
+pure_log_lines() {
+    local text="$1"
+    [[ -z "$text" ]] && return 0
+    local line
+    while IFS= read -r line; do
+        log "    ${line}"
+    done <<< "$text"
+}
+
+# Classify a named Pure object. 0 = present, 1 = Pure says it does not exist, 2 = other failure.
+# Dry-run returns 1 without contacting the array. PURE_CLI_OUT holds the CLI text.
+pure_object_state() {
+    local cmd="$1"
+    PURE_CLI_OUT=""
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 1
+    fi
+    local rc=0
+    PURE_CLI_OUT=$(storage_ssh pure "$cmd" 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$PURE_CLI_OUT" == *"does not exist"* ]]; then
+        return 1
+    fi
+    return 2
+}
+
+# Create a Pure object when the list command reports it missing.
+# Returns 1 on query or create failure. Does not log success after a failed command.
+pure_ensure() {
+    local what="$1"
+    local list_cmd="$2"
+    local create_cmd="$3"
+    local created_msg="$4"
+    local state=0
+    pure_object_state "$list_cmd" || state=$?
+    if [[ $state -eq 0 ]]; then
+        log_success "  ${what} already exists"
+        return 0
+    fi
+    if [[ $state -eq 2 ]]; then
+        log_error "  Failed to query ${what}"
+        log "    command: ${list_cmd}"
+        pure_log_lines "$PURE_CLI_OUT"
+        return 1
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would run: ${create_cmd}"
+        return 0
+    fi
+    local rc=0
+    PURE_CLI_OUT=$(storage_ssh pure "$create_cmd" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log_error "  Failed to create ${what}"
+        log "    command: ${create_cmd}"
+        pure_log_lines "$PURE_CLI_OUT"
+        return 1
+    fi
+    pure_log_lines "$PURE_CLI_OUT"
+    log_success "  ${created_msg}"
+    return 0
+}
+
+# Enable a Pure vif when the array created it disabled.
+pure_enable_if_needed() {
+    local iface="$1"
+    [[ "$DRY_RUN" == "true" ]] && return 0
+    local rc=0 out
+    out=$(storage_ssh pure "purenetwork eth list ${iface} --nvp" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log_error "  Failed to read interface ${iface}"
+        log "    command: purenetwork eth list ${iface} --nvp"
+        pure_log_lines "$out"
+        return 1
+    fi
+    if [[ "$out" != *"Enabled=False"* ]]; then
+        return 0
+    fi
+    rc=0
+    out=$(storage_ssh pure "purenetwork eth enable ${iface}" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log_error "  Failed to enable interface ${iface}"
+        log "    command: purenetwork eth enable ${iface}"
+        pure_log_lines "$out"
+        return 1
+    fi
+    pure_log_lines "$out"
+    log_success "  Interface ${iface} enabled"
+    return 0
+}
+
 # =============================================================================
-# STORAGE-SETUP: Pure FlashArray X70R5 (INSPECT ONLY — generate commands)
+# STORAGE-SETUP: Pure FlashArray X70R5
+# Subnets are puresubnet. VLAN portals are purenetwork eth create vif.
+# Host groups are purehgroup. Volume connect uses --hgroup.
 # =============================================================================
 storage_setup_pure() {
     local cloud_name="$1"
@@ -1534,7 +1629,10 @@ storage_setup_pure() {
         return 0
     fi
 
-    local hg_name="${cloud_name}_iscsi_hg"
+    # This array rejects underscores in subnet, host, and host-group names.
+    local hg_name="${cloud_name}-iscsi-hg"
+    local pure_failed=0
+    PURE_CLI_OUT=""
 
     # --- Sub-stage A: Create subnets and portal IPs ---
     log "  [A] Creating subnets and portal IPs..."
@@ -1543,42 +1641,33 @@ storage_setup_pure() {
         local vid="${vlan_ids[$idx]}"
         local sub="${subnet_bases[$idx]}"
         local pth="${paths[$idx]}"
-        local subnet_name="${cloud_name}_pure_path${pth}"
+        local subnet_name="${cloud_name}-pure-path${pth}"
+        local subnet_cmd="puresubnet create --prefix ${sub}.0/24 --vlan ${vid} --gateway ${sub}.1 --mtu 9000 ${subnet_name}"
 
-        # Check if subnet already exists
-        local sub_check
-        sub_check=$(storage_ssh pure "purenetwork subnet list" 2>/dev/null | grep -c "${subnet_name}" || true)
-        if [[ "$sub_check" -gt 0 ]]; then
-            log_success "  Subnet ${subnet_name} already exists"
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create subnet: purenetwork subnet create --vlan ${vid} --prefix ${sub}.0/24 --gateway ${sub}.1 ${subnet_name}"
-            else
-                storage_ssh pure "purenetwork subnet create --vlan ${vid} --prefix ${sub}.0/24 --gateway ${sub}.1 ${subnet_name}" 2>/dev/null || {
-                    log_error "  Failed to create subnet ${subnet_name}"
-                }
-                log_success "  Subnet ${subnet_name} created (VLAN ${vid})"
-            fi
+        if ! pure_ensure "Subnet ${subnet_name}" \
+                "puresubnet list ${subnet_name}" \
+                "$subnet_cmd" \
+                "Subnet ${subnet_name} created (VLAN ${vid})"; then
+            pure_failed=1
+            continue
         fi
 
-        # Create eth interfaces: ct0 and ct1 on eth14
+        # One vif per controller on eth14. .2 is ct0, .3 is ct1.
+        local ct_idx
         for ct_idx in 0 1; do
             local portal_ip="${sub}.$(( ct_idx + 2 ))"
             local iface="ct${ct_idx}.eth14.${vid}"
+            local eth_cmd="purenetwork eth create vif --subnet ${subnet_name} --address ${portal_ip} ${iface}"
 
-            local eth_check
-            eth_check=$(storage_ssh pure "purenetwork eth list" 2>/dev/null | grep -c "${iface}" || true)
-            if [[ "$eth_check" -gt 0 ]]; then
-                log_success "  Interface ${iface} already exists"
-            else
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    log "[DRY-RUN] Would create: purenetwork eth create --address ${portal_ip} ${iface}"
-                else
-                    storage_ssh pure "purenetwork eth create --address ${portal_ip} ${iface}" 2>/dev/null || {
-                        log_error "  Failed to create interface ${iface}"
-                    }
-                    log_success "  Interface ${iface} created (${portal_ip})"
-                fi
+            if ! pure_ensure "Interface ${iface}" \
+                    "purenetwork eth list ${iface}" \
+                    "$eth_cmd" \
+                    "Interface ${iface} created (${portal_ip})"; then
+                pure_failed=1
+                continue
+            fi
+            if ! pure_enable_if_needed "$iface"; then
+                pure_failed=1
             fi
         done
     done
@@ -1591,80 +1680,71 @@ storage_setup_pure() {
     for (( i=1; i<=LUN_COUNT; i++ )); do
         local vol_name
         vol_name=$(printf "${cloud_name}_iscsi_lta_pure_vol%02d" "$i")
-
-        local vol_check
-        vol_check=$(storage_ssh pure "purevol list" 2>/dev/null | grep -c "${vol_name}" || true)
-        if [[ "$vol_check" -gt 0 ]]; then
-            log_success "  Volume ${vol_name} already exists"
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: purevol create --size ${pure_size} ${vol_name}"
-            else
-                storage_ssh pure "purevol create --size ${pure_size} ${vol_name}" 2>/dev/null || {
-                    log_error "  Failed to create volume ${vol_name}"
-                    continue
-                }
-                log_success "  Volume ${vol_name} created (${pure_size})"
-            fi
+        local vol_cmd="purevol create --size ${pure_size} ${vol_name}"
+        if ! pure_ensure "Volume ${vol_name}" \
+                "purevol list ${vol_name}" \
+                "$vol_cmd" \
+                "Volume ${vol_name} created (${pure_size})"; then
+            pure_failed=1
         fi
     done
 
     # --- Sub-stage C: Create hosts and host group ---
     log "  [C] Creating hosts and host group..."
-
-    # Create host group
-    local hg_check
-    hg_check=$(storage_ssh pure "purehostgroup list" 2>/dev/null | grep -c "${hg_name}" || true)
-    if [[ "$hg_check" -gt 0 ]]; then
-        log_success "  Host group ${hg_name} already exists"
-    else
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create: purehostgroup create ${hg_name}"
-        else
-            storage_ssh pure "purehostgroup create ${hg_name}" 2>/dev/null || {
-                log_error "  Failed to create host group ${hg_name}"
-            }
-            log_success "  Host group ${hg_name} created"
-        fi
+    if ! pure_ensure "Host group ${hg_name}" \
+            "purehgroup list ${hg_name}" \
+            "purehgroup create ${hg_name}" \
+            "Host group ${hg_name} created"; then
+        pure_failed=1
     fi
 
-    # Create per-worker hosts and connect to host group
+    local pair
     for pair in "${iqn_pairs[@]}"; do
+        [[ -z "$pair" ]] && continue
         local worker_name="${pair%%:*}"
         local iqn="${pair#*:}"
-        local host_name="${cloud_name}_host_${worker_name}"
+        local host_name="${cloud_name}-host-${worker_name}"
+        local host_cmd="purehost create --iqnlist ${iqn} ${host_name}"
 
-        local host_check
-        host_check=$(storage_ssh pure "purehost list" 2>/dev/null | grep -c "${host_name}" || true)
-        if [[ "$host_check" -gt 0 ]]; then
-            log_success "  Host ${host_name} already exists"
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: purehost create --iqnlist ${iqn} ${host_name}"
-            else
-                storage_ssh pure "purehost create --iqnlist ${iqn} ${host_name}" 2>/dev/null || {
-                    log_error "  Failed to create host ${host_name}"
-                    continue
-                }
-                log_success "  Host ${host_name} created (${iqn})"
-            fi
+        if ! pure_ensure "Host ${host_name}" \
+                "purehost list ${host_name}" \
+                "$host_cmd" \
+                "Host ${host_name} created (${iqn})"; then
+            pure_failed=1
+            continue
         fi
 
-        # Connect host to host group (idempotent — Pure ignores if already connected)
-        local conn_check
-        conn_check=$(storage_ssh pure "purehost list --connect" 2>/dev/null | grep "${host_name}" | grep -c "${hg_name}" || true)
-        if [[ "$conn_check" -gt 0 ]]; then
+        local member_cmd="purehgroup setattr --addhostlist ${host_name} ${hg_name}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would run: ${member_cmd}"
+            continue
+        fi
+
+        local member_out member_rc=0
+        member_out=$(storage_ssh pure "purehost list ${host_name} --csv" 2>&1) || member_rc=$?
+        if [[ $member_rc -ne 0 ]]; then
+            log_error "  Failed to read host group membership for ${host_name}"
+            log "    command: purehost list ${host_name} --csv"
+            pure_log_lines "$member_out"
+            pure_failed=1
+            continue
+        fi
+        if grep -Fq "${hg_name}" <<< "$member_out"; then
             log_success "  Host ${host_name} already in ${hg_name}"
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would connect: purehost connect --hostgroup ${hg_name} ${host_name}"
-            else
-                storage_ssh pure "purehost connect --hostgroup ${hg_name} ${host_name}" 2>/dev/null || {
-                    log_error "  Failed to connect ${host_name} to ${hg_name}"
-                }
-                log_success "  Host ${host_name} connected to ${hg_name}"
-            fi
+            continue
         fi
+
+        member_rc=0
+        member_out=$(storage_ssh pure "$member_cmd" 2>&1) || member_rc=$?
+        if [[ $member_rc -ne 0 ]]; then
+            log_error "  Failed to add ${host_name} to ${hg_name}"
+            log "    command: ${member_cmd}"
+            pure_log_lines "$member_out"
+            pure_failed=1
+            continue
+        fi
+        pure_log_lines "$member_out"
+        log_success "  Host ${host_name} added to ${hg_name}"
     done
 
     # --- Sub-stage D: Map volume(s) to host group ---
@@ -1672,36 +1752,101 @@ storage_setup_pure() {
     for (( i=1; i<=LUN_COUNT; i++ )); do
         local vol_name
         vol_name=$(printf "${cloud_name}_iscsi_lta_pure_vol%02d" "$i")
+        local map_cmd="purevol connect --hgroup ${hg_name} ${vol_name}"
 
-        local map_check
-        map_check=$(storage_ssh pure "purevol list --connect" 2>/dev/null | grep "${vol_name}" | grep -c "${hg_name}" || true)
-        if [[ "$map_check" -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would run: ${map_cmd}"
+            continue
+        fi
+
+        local map_out map_rc=0
+        map_out=$(storage_ssh pure "purevol list ${vol_name} --connect" 2>&1) || map_rc=$?
+        if [[ $map_rc -ne 0 && "$map_out" != *"does not exist"* ]]; then
+            log_error "  Failed to query mapping for ${vol_name}"
+            log "    command: purevol list ${vol_name} --connect"
+            pure_log_lines "$map_out"
+            pure_failed=1
+            continue
+        fi
+        if [[ $map_rc -eq 0 ]] && grep -Fq "${hg_name}" <<< "$map_out"; then
             log_success "  Volume ${vol_name} already mapped to ${hg_name}"
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would connect: purevol connect --hostgroup ${hg_name} ${vol_name}"
-            else
-                storage_ssh pure "purevol connect --hostgroup ${hg_name} ${vol_name}" 2>/dev/null || {
-                    log_error "  Failed to map volume ${vol_name} to ${hg_name}"
-                    continue
-                }
-                log_success "  Volume ${vol_name} mapped to ${hg_name}"
+            continue
+        fi
+
+        map_rc=0
+        map_out=$(storage_ssh pure "$map_cmd" 2>&1) || map_rc=$?
+        if [[ $map_rc -ne 0 ]]; then
+            log_error "  Failed to map volume ${vol_name} to ${hg_name}"
+            log "    command: ${map_cmd}"
+            pure_log_lines "$map_out"
+            pure_failed=1
+            continue
+        fi
+        pure_log_lines "$map_out"
+        log_success "  Volume ${vol_name} mapped to ${hg_name}"
+    done
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Pure storage-setup preview complete for ${cloud_name}"
+        return 0
+    fi
+
+    # --- Verify named objects. Do not scan the full ethernet table. ---
+    log "  Verifying final state..."
+    local verify_cmd verify_out verify_rc
+    for (( idx=0; idx<${#vlan_ids[@]}; idx++ )); do
+        local vid="${vlan_ids[$idx]}"
+        local sub="${subnet_bases[$idx]}"
+        local pth="${paths[$idx]}"
+        local subnet_name="${cloud_name}-pure-path${pth}"
+        verify_cmd="puresubnet list ${subnet_name}"
+        verify_rc=0
+        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+        pure_log_lines "$verify_out"
+        if [[ $verify_rc -ne 0 ]]; then
+            log_error "  Verify failed: ${verify_cmd}"
+            pure_failed=1
+        fi
+        local ct_idx
+        for ct_idx in 0 1; do
+            local iface="ct${ct_idx}.eth14.${vid}"
+            verify_cmd="purenetwork eth list ${iface} --nvp"
+            verify_rc=0
+            verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+            pure_log_lines "$verify_out"
+            if [[ $verify_rc -ne 0 || "$verify_out" == *"Enabled=False"* ]]; then
+                log_error "  Verify failed: ${iface} is missing or disabled"
+                pure_failed=1
             fi
+        done
+    done
+
+    verify_cmd="purehgroup list ${hg_name}"
+    verify_rc=0
+    verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+    pure_log_lines "$verify_out"
+    if [[ $verify_rc -ne 0 ]]; then
+        log_error "  Verify failed: ${verify_cmd}"
+        pure_failed=1
+    fi
+
+    for (( i=1; i<=LUN_COUNT; i++ )); do
+        local vol_name
+        vol_name=$(printf "${cloud_name}_iscsi_lta_pure_vol%02d" "$i")
+        verify_cmd="purevol list ${vol_name} --connect"
+        verify_rc=0
+        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
+        pure_log_lines "$verify_out"
+        if [[ $verify_rc -ne 0 ]] || ! grep -Fq "${hg_name}" <<< "$verify_out"; then
+            log_error "  Verify failed: ${vol_name} is not connected to ${hg_name}"
+            pure_failed=1
         fi
     done
 
-    # --- Verify ---
-    log "  Verifying final state..."
-    local verify_out
-    verify_out=$(storage_ssh pure "purenetwork subnet list" 2>/dev/null) || true
-    echo "$verify_out" | grep -E "${cloud_name}" | while IFS= read -r line; do
-        log "    $line"
-    done || true
-    verify_out=$(storage_ssh pure "purevol list --connect" 2>/dev/null) || true
-    echo "$verify_out" | grep -E "${cloud_name}" | while IFS= read -r line; do
-        log "    $line"
-    done || true
-
+    if [[ "$pure_failed" -ne 0 ]]; then
+        log_error "  Pure storage-setup failed for ${cloud_name}"
+        return 1
+    fi
     log_success "  Pure storage-setup complete for ${cloud_name}"
 }
 
