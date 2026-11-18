@@ -556,7 +556,7 @@ HEADER
         local prev_host=""
         tail -n +2 "$csv_file" | sort | while IFS=',' read -r hostname iface mac; do
             local nic_num="${iface#em}"
-            echo "quads --modify-switch-conf --host ${hostname} --nic${nic_num} ${CLOUD99_OUTER_VLAN} --change # reassign vlan membership from ${cloud_name} for ${mac} to cloud99"
+            echo "quads --mod-switch-conf --host ${hostname} --nic${nic_num} ${CLOUD99_OUTER_VLAN} --change # reassign vlan membership from ${cloud_name} for ${mac} to cloud99"
         done
 
         echo ""
