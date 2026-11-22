@@ -39,7 +39,7 @@ The script runs in stages that can be executed individually or all at once:
 | `verify` | Check that target interfaces aren't already assigned to cloud99 |
 | `jira-draft` | Generate a VLAN-change Jira request for ScaleLab ops |
 | `host-setup` | Create storage VLAN interfaces: NNCPs on OCP, nmcli on bare metal, govc portgroups and DHCP vmkernels on the ESXi hosts under `VMWARE_HOST_FOLDER`. On OCP, install multipath.conf with a worker MachineConfig |
-| `storage-setup` | Configure storage arrays: portals, volumes, hosts, LUN mappings |
+| `storage-setup` | Configure storage arrays: portals, volumes, hosts, LUN mappings. VMware initiator IQNs come from `govc` |
 | `check` | Verify connectivity from workers to storage portal IPs |
 | `all` | Run all stages in order |
 
@@ -55,7 +55,7 @@ For each vendor in `STORAGE_ARRAYS`, the storage-setup stage runs:
 | **B** | Create volumes / LUNs |
 | **C** | Create host objects / igroups with worker IQNs |
 | **D** | Map LUNs to hosts |
-| **E** | Run iSCSI discovery + login from each worker, verify multipath |
+| **E** | On OCP, run iSCSI discovery and login from each worker and verify multipath. On VMware, add send targets with `govc` and check for a `logged_in` session. The QUADS `verify` stage does not use `govc` |
 
 Every create operation checks for existing resources first (idempotent). Re-running is safe.
 
@@ -129,7 +129,7 @@ On the provisioner node:
 - `jq`, `sshpass`, `curl`
 - `bws` CLI (Bitwarden Secrets Manager) with `BWS_ACCESS_TOKEN` set
 - `oc` (for OCP target type) with a valid KUBECONFIG
-- `govc` (for `TARGET_TYPE=vmware`) with `GOVC_URL`, `GOVC_USERNAME`, `GOVC_PASSWORD`, and `GOVC_INSECURE` set in the shell. Those values are not read from the env file. VMware host-setup lists hosts with `govc find -type h` under `VMWARE_HOST_FOLDER` and does not use the QUADS cloud list.
+- `govc` (for `TARGET_TYPE=vmware`) with `GOVC_URL`, `GOVC_USERNAME`, `GOVC_PASSWORD`, and `GOVC_INSECURE` set in the shell. Those values are not read from the env file. Host-setup lists hosts with `govc find -type h` under `VMWARE_HOST_FOLDER`. Storage-setup reads each host's IQN from `iscsi adapter get` and checks iSCSI sessions the same way. The QUADS `verify` stage does not use `govc`.
 
 ## Project Structure
 

@@ -1115,6 +1115,47 @@ vmware_list_hosts() {
     printf '%s\n' "$paths"
 }
 
+# Selected ESXi inventory paths, one per line. Same -w and EXCLUDE_HOSTS
+# filter as host-setup. An empty result returns 1.
+vmware_selected_hosts() {
+    local hosts
+    if ! hosts=$(vmware_list_hosts); then
+        return 1
+    fi
+
+    local -a selected=()
+    local ipath skip excl
+    while IFS= read -r ipath; do
+        [[ -z "$ipath" ]] && continue
+        skip=false
+        if [[ -n "$EXCLUDE_HOSTS" ]]; then
+            for excl in $EXCLUDE_HOSTS; do
+                if [[ "$ipath" == *"$excl"* ]]; then
+                    skip=true
+                fi
+            done
+        fi
+        if [[ "$skip" == "true" ]]; then
+            log "Skipping excluded host: ${ipath}"
+            continue
+        fi
+        if [[ -n "$SINGLE_WORKER" && "$ipath" != *"$SINGLE_WORKER"* ]]; then
+            continue
+        fi
+        selected+=("$ipath")
+    done <<< "$hosts"
+
+    if (( ${#selected[@]} == 0 )); then
+        if [[ -n "$SINGLE_WORKER" ]]; then
+            log_error "No ESXi hosts under ${VMWARE_HOST_FOLDER} match '${SINGLE_WORKER}'"
+        else
+            log_error "No ESXi hosts selected under ${VMWARE_HOST_FOLDER}"
+        fi
+        return 1
+    fi
+    printf '%s\n' "${selected[@]}"
+}
+
 # First DNS label of a vCenter inventory path, for VMWARE_HOST_MAP.
 vmware_short_name() {
     local base="${1##*/}"
@@ -1148,6 +1189,36 @@ vmware_esxcli() {
     fi
     log_verbose "govc host.esxcli -host.ipath ${ipath} $*"
     govc host.esxcli -host.ipath "$ipath" "$@"
+}
+
+# Same as a write through vmware_esxcli, but the govc client is killed if it
+# does not return within the given seconds. Exit 124 is that timeout.
+vmware_esxcli_bounded() {
+    local seconds="$1" ipath="$2"
+    shift 2
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would run: govc host.esxcli -host.ipath ${ipath} $*"
+        return 0
+    fi
+    log_verbose "govc host.esxcli -host.ipath ${ipath} $*"
+    timeout "$seconds" govc host.esxcli -host.ipath "$ipath" "$@"
+}
+
+# Name: value from `iscsi adapter get` that starts with iqn.
+vmware_adapter_iqn() {
+    local ipath="$1"
+    local out status=0 name
+    out=$(vmware_esxcli read "$ipath" iscsi adapter get -A "$VMWARE_ISCSI_ADAPTER" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  ${ipath}: iscsi adapter get failed: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    name=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*Name:[[:space:]]*//p' | tr -d '\r' | sed -n '/^iqn\./{p;q}')
+    if [[ -z "$name" || "$name" != iqn.* ]]; then
+        log_error "  ${ipath}: adapter ${VMWARE_ISCSI_ADAPTER} did not return an IQN"
+        return 1
+    fi
+    printf '%s\n' "$name"
 }
 
 vmware_reset_caches() {
@@ -1674,41 +1745,13 @@ do_host_setup_vmware() {
         vmware_pg_name "$vendor" A >/dev/null || return 1
     done
 
-    local hosts
-    if ! hosts=$(vmware_list_hosts); then
+    local hosts_out="" sel_status=0
+    hosts_out=$(vmware_selected_hosts) || sel_status=$?
+    if [[ "$sel_status" -ne 0 || -z "$hosts_out" ]]; then
         return 1
     fi
-
     local -a selected=()
-    local ipath skip excl
-    while IFS= read -r ipath; do
-        [[ -z "$ipath" ]] && continue
-        skip=false
-        if [[ -n "$EXCLUDE_HOSTS" ]]; then
-            for excl in $EXCLUDE_HOSTS; do
-                if [[ "$ipath" == *"$excl"* ]]; then
-                    skip=true
-                fi
-            done
-        fi
-        if [[ "$skip" == "true" ]]; then
-            log "Skipping excluded host: ${ipath}"
-            continue
-        fi
-        if [[ -n "$SINGLE_WORKER" && "$ipath" != *"$SINGLE_WORKER"* ]]; then
-            continue
-        fi
-        selected+=("$ipath")
-    done <<< "$hosts"
-
-    if (( ${#selected[@]} == 0 )); then
-        if [[ -n "$SINGLE_WORKER" ]]; then
-            log_error "No ESXi hosts under ${VMWARE_HOST_FOLDER} match '${SINGLE_WORKER}'"
-        else
-            log_error "No ESXi hosts selected under ${VMWARE_HOST_FOLDER}"
-        fi
-        return 1
-    fi
+    mapfile -t selected <<< "$hosts_out"
 
     log "ESXi hosts from ${VMWARE_HOST_FOLDER}: ${#selected[@]}"
     log "VLAN layout plan (ESXi portgroups, no NIC flip):"
@@ -1880,11 +1923,21 @@ bws_get() {
 }
 
 storage_ssh() {
+    # --read runs svcinfo even during a dry-run. Writes stay logged-only.
+    local read_only=false
+    if [[ "${1:-}" == "--read" ]]; then
+        read_only=true
+        shift
+    fi
     local vendor="$1"; shift
 
-    if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ "$DRY_RUN" == "true" && "$read_only" != "true" ]]; then
         log "[DRY-RUN] Would SSH to ${vendor}: $*"
         return 0
+    fi
+    if [[ "$read_only" == "true" && "$1" != svcinfo && "$1" != svcinfo\ * ]]; then
+        log_error "storage_ssh --read only runs svcinfo (refusing: $1)"
+        return 1
     fi
 
     local host user pw
@@ -1922,6 +1975,28 @@ storage_ssh() {
     sshpass -p "$pw" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o PubkeyAuthentication=no "${user}@${host}" "$@"
 }
 
+# Run one storage write. A non-zero status logs the message and the array
+# output, then returns 1. Success does not by itself mean the object exists;
+# the caller logs [OK] only after this returns 0.
+storage_apply() {
+    local vendor="$1"
+    local message="$2"
+    shift 2
+    local out status=0 line
+    out=$(storage_ssh "$vendor" "$@" 2>&1) || status=$?
+    out=${out//$'\r'/$'\n'}
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  ${message}"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log "    ${line}"
+        done <<< "$out"
+        return 1
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log "    ${line}"
+    done <<< "$out"
+}
+
 # =============================================================================
 # Collect iSCSI initiator IQNs from workers
 # =============================================================================
@@ -1946,6 +2021,29 @@ collect_worker_iqns() {
                 log_warn "  ${node}: no valid IQN found"
             fi
         done
+    elif [[ "$TARGET_TYPE" == "vmware" ]]; then
+        # This loop stays in the current shell. The QUADS arm below is a
+        # pipeline, and ESXi has no /etc/iscsi/initiatorname.iscsi to SSH.
+        vmware_preflight || return 1
+        local hosts_out="" sel_status=0
+        hosts_out=$(vmware_selected_hosts) || sel_status=$?
+        if [[ "$sel_status" -ne 0 || -z "$hosts_out" ]]; then
+            return 1
+        fi
+        local -a pending=()
+        local ipath short name item
+        while IFS= read -r ipath; do
+            [[ -z "$ipath" ]] && continue
+            name=$(vmware_adapter_iqn "$ipath") || return 1
+            short=$(vmware_short_name "$ipath")
+            pending+=("${short}:${name}")
+        done <<< "$hosts_out"
+        if (( ${#pending[@]} > 0 )); then
+            for item in "${pending[@]}"; do
+                iqns+=("$item")
+                log "  ${item%%:*}: ${item#*:}"
+            done
+        fi
     else
         local json
         json=$(quads_query_hosts) || return 1
@@ -2004,6 +2102,29 @@ parse_lun_size_pure() {
     esac
 }
 
+# ESXi initiators need ostype vmware. OCP and bare stay on linux.
+# The value is used only when the igroup or LUN is created.
+storage_target_ostype() {
+    if [[ "$TARGET_TYPE" == "vmware" ]]; then
+        printf '%s\n' vmware
+    else
+        printf '%s\n' linux
+    fi
+}
+
+# Log the ostype already stored on a NetApp object. Does not change it.
+netapp_log_ostype() {
+    local vendor="$1"
+    local label="$2"
+    shift 2
+    local out stored
+    out=$(storage_ssh "$vendor" "$*" 2>/dev/null || true)
+    stored=$(printf '%s\n' "$out" | awk 'NF && $NF != "ostype" && $1 != "vserver" && $1 !~ /^-/ { print $NF; exit }')
+    if [[ -n "$stored" ]]; then
+        log "  ${label} ostype is ${stored}"
+    fi
+}
+
 # =============================================================================
 # STORAGE-SETUP: NetApp ASA A70
 # =============================================================================
@@ -2015,6 +2136,8 @@ storage_setup_netapp_asa() {
 
     log ""
     log "--- NetApp ASA A70: storage-setup for ${cloud_name} ---"
+    local os_type
+    os_type=$(storage_target_ostype)
 
     local svm="svm_${cloud_name}"
     local ipspace="ipspace_${cloud_name}"
@@ -2058,7 +2181,8 @@ storage_setup_netapp_asa() {
         if [[ "$ipspace_check" -gt 0 ]]; then
             log_success "  IPspace ${ipspace} already exists"
         else
-            storage_ssh netapp-asa "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace creation failed (may already exist)"
+            storage_apply netapp-asa "Failed to create IPspace ${ipspace}" \
+                "ipspace create -ipspace ${ipspace}" || return 1
             log_success "  IPspace ${ipspace} created"
         fi
 
@@ -2070,7 +2194,8 @@ storage_setup_netapp_asa() {
             if [[ "$bd_check" -gt 0 ]]; then
                 log_success "  Broadcast domain ${bd} already exists"
             else
-                storage_ssh netapp-asa "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || log_warn "  Broadcast domain ${bd} creation failed"
+                storage_apply netapp-asa "Failed to create broadcast domain ${bd}" \
+                    "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" || return 1
                 log_success "  Broadcast domain ${bd} created"
             fi
         done
@@ -2089,14 +2214,16 @@ storage_setup_netapp_asa() {
                 cur_bd=$(storage_ssh netapp-asa "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
                 if [[ -z "$cur_bd" ]]; then
                     # VLAN port doesn't exist yet — create it (auto-assigned to a Default-ipspace domain)
-                    storage_ssh netapp-asa "network port vlan create -node ${node} -vlan-name ${vp}" 2>/dev/null || log_warn "  VLAN port ${node}:${vp} creation failed"
+                    storage_apply netapp-asa "Failed to create VLAN port ${node}:${vp}" \
+                        "network port vlan create -node ${node} -vlan-name ${vp}" || return 1
                     log_success "  VLAN port ${node}:${vp} created"
                 elif [[ "$cur_bd" == "$target_bd" ]]; then
                     log_verbose "  ${node}:${vp} already in ${target_bd}"
                     continue
                 elif [[ "$cur_bd" != "-" ]]; then
                     log "  Moving ${node}:${vp} from ${cur_bd} to ${target_bd}"
-                    storage_ssh netapp-asa "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                    storage_apply netapp-asa "Failed to remove ${node}:${vp} from ${cur_bd}" \
+                        "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" || return 1
                 fi
                 if [[ "$target_bd" == "$bd_a" ]]; then
                     add_a+=("${node}:${vp}")
@@ -2107,13 +2234,15 @@ storage_setup_netapp_asa() {
         done
 
         if (( ${#add_a[@]} > 0 )); then
-            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_a}"
+            storage_apply netapp-asa "Failed to add ports to ${bd_a}" \
+                "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" || return 1
             log_success "  Ports added to ${bd_a}"
         else
             log_success "  Path-A ports already homed in ${bd_a}"
         fi
         if (( ${#add_b[@]} > 0 )); then
-            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_b}"
+            storage_apply netapp-asa "Failed to add ports to ${bd_b}" \
+                "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" || return 1
             log_success "  Ports added to ${bd_b}"
         else
             log_success "  Path-B ports already homed in ${bd_b}"
@@ -2125,7 +2254,8 @@ storage_setup_netapp_asa() {
         if [[ "$svm_exists" -gt 0 ]]; then
             log_success "  SVM ${svm} already exists"
         else
-            storage_ssh netapp-asa "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || log_warn "  SVM creation failed"
+            storage_apply netapp-asa "Failed to create SVM ${svm}" \
+                "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" || return 1
             log_success "  SVM ${svm} created"
         fi
 
@@ -2145,10 +2275,14 @@ storage_setup_netapp_asa() {
             done || true
         else
             log "  Creating LIFs (found ${lif_count}/4)..."
-            storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node1}_a" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node2}_a" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node1}_b" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node2}_b" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" || return 1
             log_success "  LIF creation commands issued"
         fi
     fi
@@ -2163,14 +2297,13 @@ storage_setup_netapp_asa() {
         lun_check=$(storage_ssh netapp-asa "lun show -vserver ${svm} -path ${lun_name} -fields path" 2>/dev/null | grep -c "${lun_name}" || true)
         if [[ "$lun_check" -gt 0 ]]; then
             log_success "  LUN ${lun_name} already exists"
+            netapp_log_ostype netapp-asa "LUN ${lun_name}" "lun show -vserver ${svm} -path ${lun_name} -fields ostype"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: lun create -vserver ${svm} -path ${lun_name} -size ${LUN_SIZE} -ostype linux"
+                log "[DRY-RUN] Would create: lun create -vserver ${svm} -path ${lun_name} -size ${LUN_SIZE} -ostype ${os_type}"
             else
-                storage_ssh netapp-asa "lun create -vserver ${svm} -path ${lun_name} -size ${LUN_SIZE} -ostype linux" 2>/dev/null || {
-                    log_error "  Failed to create LUN ${lun_name}"
-                    continue
-                }
+                storage_apply netapp-asa "Failed to create LUN ${lun_name}" \
+                    "lun create -vserver ${svm} -path ${lun_name} -size ${LUN_SIZE} -ostype ${os_type}" || return 1
                 log_success "  LUN ${lun_name} created (${LUN_SIZE})"
             fi
         fi
@@ -2191,6 +2324,7 @@ storage_setup_netapp_asa() {
 
     if [[ "$ig_check" -gt 0 ]]; then
         log_success "  igroup ${ig_name} already exists"
+        netapp_log_ostype netapp-asa "igroup ${ig_name}" "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields ostype"
         # Add any missing initiators
         for pair in "${iqn_pairs[@]}"; do
             local worker_name="${pair%%:*}"
@@ -2199,7 +2333,8 @@ storage_setup_netapp_asa() {
             already=$(storage_ssh netapp-asa "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields initiator" 2>/dev/null | grep -c "$iqn" || true)
             if [[ "$already" -eq 0 ]]; then
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    storage_ssh netapp-asa "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" 2>/dev/null || true
+                    storage_apply netapp-asa "Failed to add initiator ${iqn} to ${ig_name}" \
+                        "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" || return 1
                     log "  Added initiator ${iqn} (${worker_name}) to ${ig_name}"
                 else
                     log "[DRY-RUN] Would add initiator ${iqn} to ${ig_name}"
@@ -2208,12 +2343,10 @@ storage_setup_netapp_asa() {
         done
     else
         if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create igroup ${ig_name} with initiators: ${iqn_list}"
+            log "[DRY-RUN] Would create igroup ${ig_name} -ostype ${os_type} with initiators: ${iqn_list}"
         elif [[ -n "$iqn_list" ]]; then
-            storage_ssh netapp-asa "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype linux -initiator ${iqn_list}" 2>/dev/null || {
-                log_error "  Failed to create igroup ${ig_name}"
-                return 1
-            }
+            storage_apply netapp-asa "Failed to create igroup ${ig_name}" \
+                "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype ${os_type} -initiator ${iqn_list}" || return 1
             log_success "  igroup ${ig_name} created with ${#iqn_pairs[@]} initiators"
         else
             log_warn "  No IQNs collected — skipping igroup creation"
@@ -2234,10 +2367,8 @@ storage_setup_netapp_asa() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would map: lun mapping create -vserver ${svm} -path ${lun_name} -igroup ${ig_name} -lun-id ${lun_id}"
             else
-                storage_ssh netapp-asa "lun mapping create -vserver ${svm} -path ${lun_name} -igroup ${ig_name} -lun-id ${lun_id}" 2>/dev/null || {
-                    log_error "  Failed to map LUN ${lun_name}"
-                    continue
-                }
+                storage_apply netapp-asa "Failed to map LUN ${lun_name}" \
+                    "lun mapping create -vserver ${svm} -path ${lun_name} -igroup ${ig_name} -lun-id ${lun_id}" || return 1
                 log_success "  LUN ${lun_name} mapped to ${ig_name} (lun-id ${lun_id})"
             fi
         fi
@@ -2277,7 +2408,7 @@ pure_object_state() {
         return 1
     fi
     local rc=0
-    PURE_CLI_OUT=$(storage_ssh pure "$cmd") || rc=$?
+    PURE_CLI_OUT=$(storage_ssh pure "$cmd" 2>&1) || rc=$?
     if [[ $rc -eq 0 ]]; then
         return 0
     fi
@@ -2311,7 +2442,7 @@ pure_ensure() {
         return 0
     fi
     local rc=0
-    PURE_CLI_OUT=$(storage_ssh pure "$create_cmd") || rc=$?
+    PURE_CLI_OUT=$(storage_ssh pure "$create_cmd" 2>&1) || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to create ${what}"
         log "    command: ${create_cmd}"
@@ -2331,7 +2462,7 @@ pure_enable_if_needed() {
         return 0
     fi
     local rc=0 out
-    out=$(storage_ssh pure "purenetwork eth list ${iface} --nvp") || rc=$?
+    out=$(storage_ssh pure "purenetwork eth list ${iface} --nvp" 2>&1) || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to read interface ${iface}"
         log "    command: purenetwork eth list ${iface} --nvp"
@@ -2342,7 +2473,7 @@ pure_enable_if_needed() {
         return 0
     fi
     rc=0
-    out=$(storage_ssh pure "purenetwork eth enable ${iface}") || rc=$?
+    out=$(storage_ssh pure "purenetwork eth enable ${iface}" 2>&1) || rc=$?
     if [[ $rc -ne 0 ]]; then
         log_error "  Failed to enable interface ${iface}"
         log "    command: purenetwork eth enable ${iface}"
@@ -2459,6 +2590,15 @@ storage_setup_pure() {
         local host_name="${cloud_name}-host-${worker_name}"
         local host_cmd="purehost create --iqnlist ${iqn} ${host_name}"
 
+        if [[ "$DRY_RUN" != "true" ]]; then
+            local owner=""
+            owner=$(storage_ssh pure "purehost list" 2>&1 | awk -v iqn="$iqn" 'index($0, iqn) { print $1; exit }' || true)
+            if [[ -n "$owner" && "$owner" != "$host_name" ]]; then
+                log "  IQN ${iqn} is already on Pure host ${owner}; leaving that host unchanged"
+                continue
+            fi
+        fi
+
         if ! pure_ensure "Host ${host_name}" \
                 "purehost list ${host_name}" \
                 "$host_cmd" \
@@ -2474,7 +2614,7 @@ storage_setup_pure() {
         fi
 
         local member_out member_rc=0
-        member_out=$(storage_ssh pure "purehost list ${host_name} --csv") || member_rc=$?
+        member_out=$(storage_ssh pure "purehost list ${host_name} --csv" 2>&1) || member_rc=$?
         if [[ $member_rc -ne 0 ]]; then
             log_error "  Failed to read host group membership for ${host_name}"
             log "    command: purehost list ${host_name} --csv"
@@ -2488,7 +2628,7 @@ storage_setup_pure() {
         fi
 
         member_rc=0
-        member_out=$(storage_ssh pure "$member_cmd") || member_rc=$?
+        member_out=$(storage_ssh pure "$member_cmd" 2>&1) || member_rc=$?
         if [[ $member_rc -ne 0 ]]; then
             log_error "  Failed to add ${host_name} to ${hg_name}"
             log "    command: ${member_cmd}"
@@ -2513,7 +2653,7 @@ storage_setup_pure() {
         fi
 
         local map_out map_rc=0
-        map_out=$(storage_ssh pure "purevol list ${vol_name} --connect") || map_rc=$?
+        map_out=$(storage_ssh pure "purevol list ${vol_name} --connect" 2>&1) || map_rc=$?
         if [[ $map_rc -ne 0 && "$map_out" != *"does not exist"* ]]; then
             log_error "  Failed to query mapping for ${vol_name}"
             log "    command: purevol list ${vol_name} --connect"
@@ -2527,7 +2667,7 @@ storage_setup_pure() {
         fi
 
         map_rc=0
-        map_out=$(storage_ssh pure "$map_cmd") || map_rc=$?
+        map_out=$(storage_ssh pure "$map_cmd" 2>&1) || map_rc=$?
         if [[ $map_rc -ne 0 ]]; then
             log_error "  Failed to map volume ${vol_name} to ${hg_name}"
             log "    command: ${map_cmd}"
@@ -2554,7 +2694,7 @@ storage_setup_pure() {
         local subnet_name="${cloud_name}-pure-path${pth}"
         verify_cmd="puresubnet list ${subnet_name}"
         verify_rc=0
-        verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
+        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
         pure_log_lines "$verify_out"
         if [[ $verify_rc -ne 0 ]]; then
             log_error "  Verify failed: ${verify_cmd}"
@@ -2565,7 +2705,7 @@ storage_setup_pure() {
             local iface="ct${ct_idx}.eth14.${vid}"
             verify_cmd="purenetwork eth list ${iface} --nvp"
             verify_rc=0
-            verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
+            verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
             pure_log_lines "$verify_out"
             if [[ $verify_rc -ne 0 || "$verify_out" == *"Enabled=False"* ]]; then
                 log_error "  Verify failed: ${iface} is missing or disabled"
@@ -2576,7 +2716,7 @@ storage_setup_pure() {
 
     verify_cmd="purehgroup list ${hg_name}"
     verify_rc=0
-    verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
+    verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
     pure_log_lines "$verify_out"
     if [[ $verify_rc -ne 0 ]]; then
         log_error "  Verify failed: ${verify_cmd}"
@@ -2588,7 +2728,7 @@ storage_setup_pure() {
         vol_name=$(printf "${cloud_name}_iscsi_lta_pure_vol%02d" "$i")
         verify_cmd="purevol list ${vol_name} --connect"
         verify_rc=0
-        verify_out=$(storage_ssh pure "$verify_cmd") || verify_rc=$?
+        verify_out=$(storage_ssh pure "$verify_cmd" 2>&1) || verify_rc=$?
         pure_log_lines "$verify_out"
         if [[ $verify_rc -ne 0 ]] || ! grep -Fq "${hg_name}" <<< "$verify_out"; then
             log_error "  Verify failed: ${vol_name} is not connected to ${hg_name}"
@@ -2601,6 +2741,289 @@ storage_setup_pure() {
         return 1
     fi
     log_success "  Pure storage-setup complete for ${cloud_name}"
+}
+
+# =============================================================================
+# IBM host adoption
+# A host that already has this IQN is kept, including its vdisk maps.
+# chhost runs only for a host this stage just created, or for an empty host
+# whose portset is not the cloud portset. A host-cluster member is not mapped.
+# =============================================================================
+ibm_lshost_field() {
+    local field="$1"
+    awk -v f="$field" '$1 == f { $1=""; sub(/^[[:space:]]+/, ""); print; exit }'
+}
+
+ibm_lowest_free_scsi() {
+    local occupied=" $1 "
+    local id=0
+    while [[ "$occupied" == *" ${id} "* ]]; do
+        id=$((id + 1))
+        if (( id > 511 )); then
+            return 1
+        fi
+    done
+    printf '%s\n' "$id"
+}
+
+# Prints lshost detail. Returns 2 when the host does not exist.
+ibm_lshost() {
+    local name="$1"
+    local err status=0 out msg
+    err=$(mktemp)
+    out=$(storage_ssh --read ibm "svcinfo lshost ${name}" 2>"$err") || status=$?
+    msg=$(cat "$err" 2>/dev/null || true)
+    rm -f "$err"
+    if [[ "$status" -eq 0 ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    if [[ "$msg" == *CMMVC5753E* || "$msg" == *"does not exist"* || "$out" == *CMMVC5753E* ]]; then
+        return 2
+    fi
+    log_error "  lshost ${name} failed: ${msg:-$out}"
+    return 1
+}
+
+# Prints "scsi_id vdisk_name" rows. Empty output means the host has no maps.
+ibm_vdisk_rows() {
+    local host="$1"
+    local out status=0
+    out=$(storage_ssh --read ibm "svcinfo lshostvdiskmap -nohdr -delim : ${host}" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  lshostvdiskmap ${host} failed: ${out}"
+        return 1
+    fi
+    printf '%s\n' "$out" | awk -F: 'NF >= 5 && $3 ~ /^[0-9]+$/ { print $3, $5 }'
+}
+
+# Prints the host whose iscsi_name is this IQN, or nothing when there is none.
+ibm_host_for_iqn() {
+    local iqn="$1"
+    local cloud_name="$2"
+    local short="$3"
+    local candidate detail status have
+    for candidate in "$short" "${cloud_name}_${short}"; do
+        status=0
+        detail=$(ibm_lshost "$candidate") || status=$?
+        if [[ "$status" -eq 1 ]]; then
+            return 1
+        fi
+        if [[ "$status" -ne 0 ]]; then
+            continue
+        fi
+        have=$(printf '%s\n' "$detail" | ibm_lshost_field iscsi_name)
+        if [[ "$have" == "$iqn" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    local list=0 names
+    names=$(storage_ssh --read ibm "svcinfo lshost -nohdr -delim :" 2>&1) || list=$?
+    if [[ "$list" -ne 0 ]]; then
+        log_error "  lshost list failed: ${names}"
+        return 1
+    fi
+
+    local -a found=()
+    local line name dstatus
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name=$(printf '%s\n' "$line" | awk -F: '{ print $2 }')
+        [[ -z "$name" || "$name" == "name" ]] && continue
+        [[ "$name" == "$short" || "$name" == "${cloud_name}_${short}" ]] && continue
+        dstatus=0
+        detail=$(ibm_lshost "$name") || dstatus=$?
+        if [[ "$dstatus" -eq 1 ]]; then
+            return 1
+        fi
+        if [[ "$dstatus" -ne 0 ]]; then
+            continue
+        fi
+        have=$(printf '%s\n' "$detail" | ibm_lshost_field iscsi_name)
+        if [[ "$have" == "$iqn" ]]; then
+            found+=("$name")
+        fi
+    done <<< "$names"
+
+    if (( ${#found[@]} > 1 )); then
+        log_error "  IQN ${iqn} belongs to more than one IBM host: ${found[*]}"
+        return 1
+    fi
+    if (( ${#found[@]} == 1 )); then
+        printf '%s\n' "${found[0]}"
+    fi
+}
+
+ibm_bind_one_host() {
+    local cloud_name="$1"
+    local portset_name="$2"
+    local worker_name="$3"
+    local iqn="$4"
+    local live=false
+    if [[ "$DRY_RUN" != "true" || "$TARGET_TYPE" == "vmware" ]]; then
+        live=true
+    fi
+
+    local host_name="" status=0 detail="" created=false
+    if [[ "$live" == "true" ]]; then
+        host_name=$(ibm_host_for_iqn "$iqn" "$cloud_name" "$worker_name") || return 1
+    fi
+
+    if [[ -n "$host_name" ]]; then
+        log "  IQN ${iqn} already belongs to IBM host ${host_name}"
+        status=0
+        detail=$(ibm_lshost "$host_name") || status=$?
+        if [[ "$status" -ne 0 ]]; then
+            log_error "  Could not read IBM host ${host_name}"
+            return 1
+        fi
+    else
+        host_name="${cloud_name}_${worker_name}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would create: svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}"
+            created=true
+        else
+            storage_ssh ibm "svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}" || {
+                log_error "  Failed to create host ${host_name}"
+                return 1
+            }
+            log_success "  Host ${host_name} created (IQN: ${iqn})"
+            created=true
+            status=0
+            detail=$(ibm_lshost "$host_name") || status=$?
+            if [[ "$status" -ne 0 ]]; then
+                log_error "  Host ${host_name} was created but lshost failed"
+                return 1
+            fi
+        fi
+    fi
+
+    local rows="" occupied="" sid vname desc
+    if [[ "$created" == "true" && "$DRY_RUN" == "true" ]]; then
+        log "  ${host_name} occupied SCSI ids: none"
+    else
+        rows=$(ibm_vdisk_rows "$host_name") || return 1
+        if [[ -z "$rows" ]]; then
+            log "  ${host_name} occupied SCSI ids: none"
+        else
+            desc=""
+            while read -r sid vname; do
+                [[ -z "$sid" ]] && continue
+                occupied+=" ${sid}"
+                desc+="${sid}=${vname} "
+            done <<< "$rows"
+            log "  ${host_name} occupied SCSI ids:${occupied} (${desc% })"
+        fi
+    fi
+
+    if [[ -n "$detail" ]]; then
+        local cur_portset cluster map_lines
+        cur_portset=$(printf '%s\n' "$detail" | ibm_lshost_field portset_name)
+        cluster=$(printf '%s\n' "$detail" | ibm_lshost_field host_cluster_name)
+        map_lines=0
+        if [[ -n "$rows" ]]; then
+            map_lines=$(printf '%s\n' "$rows" | wc -l)
+            map_lines=${map_lines// /}
+        fi
+        if (( map_lines > 0 )); then
+            log "  ${host_name} portset is ${cur_portset:-unset}; leaving it because the host has vdisk maps"
+        elif [[ "$cur_portset" != "$portset_name" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log "[DRY-RUN] Would run: svctask chhost -portset ${portset_name} ${host_name}"
+            else
+                storage_ssh ibm "svctask chhost -portset ${portset_name} ${host_name}" || {
+                    log_error "  chhost failed for ${host_name}; existing maps were left in place"
+                    return 1
+                }
+                log "  Moved ${host_name} from portset '${cur_portset}' to '${portset_name}'"
+            fi
+        fi
+        if [[ -n "$cluster" ]]; then
+            local free
+            free=$(ibm_lowest_free_scsi "$occupied") || free="none"
+            log "  ${host_name} is a member of host cluster ${cluster}; leaving vdisk maps unchanged"
+            log "  Lowest free SCSI id on ${host_name} is ${free}; not used"
+            return 0
+        fi
+    fi
+
+    local planned="$occupied" i vdisk free
+    for (( i=1; i<=LUN_COUNT; i++ )); do
+        vdisk=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
+        if [[ -n "$rows" ]] && printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { found=1 } END { exit found ? 0 : 1 }'; then
+            log_success "  vdisk ${vdisk} already mapped to ${host_name}"
+            # Keep that SCSI id occupied so the next vdisk takes a different one.
+            sid=$(printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { print $1; exit }')
+            if [[ -n "$sid" && "$planned" != *" ${sid} "* && "$planned" != "${sid}" ]]; then
+                planned+=" ${sid}"
+            fi
+            continue
+        fi
+        free=$(ibm_lowest_free_scsi "$planned") || {
+            log_error "  No free SCSI id on ${host_name}"
+            return 1
+        }
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -scsi ${free} ${vdisk}"
+        else
+            if ! storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -scsi ${free} ${vdisk}"; then
+                log_error "  Failed to map ${vdisk} to ${host_name}; existing maps were left in place"
+                return 1
+            fi
+            log_success "  vdisk ${vdisk} mapped to ${host_name} (scsi ${free})"
+        fi
+        planned+=" ${free}"
+        log "  Lowest free SCSI id used for ${vdisk} on ${host_name} is ${free}"
+    done
+}
+
+ibm_bind_hosts() {
+    local cloud_name="$1"
+    local portset_name="$2"
+    shift 2
+    local -a iqn_pairs=("$@")
+
+    if [[ "$DRY_RUN" != "true" || "$TARGET_TYPE" == "vmware" ]]; then
+        if [[ -z "${_BWS_CACHE}" ]]; then
+            bws_load_cache || return 1
+            log "Credential cache loaded (${#_BWS_CACHE} bytes, storage credentials only)"
+        fi
+    fi
+
+    local failed=0 pair worker_name iqn
+    for pair in "${iqn_pairs[@]}"; do
+        [[ -z "$pair" ]] && continue
+        worker_name="${pair%%:*}"
+        iqn="${pair#*:}"
+        if ! ibm_bind_one_host "$cloud_name" "$portset_name" "$worker_name" "$iqn"; then
+            failed=1
+        fi
+    done
+    if [[ "$failed" -ne 0 ]]; then
+        return 1
+    fi
+}
+
+# 0 when lsip shows this IP in the portset, 1 when it does not, 2 when lsip fails.
+# This array rejects svcinfo lsportsetmember, so membership is the portset column of lsip.
+ibm_portset_has_ip() {
+    local portset="$1"
+    local ip="$2"
+    local out status=0 line
+    out=$(storage_ssh --read ibm "svcinfo lsip -delim :" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  lsip failed while checking portset ${portset}"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log "    ${line}"
+        done <<< "$out"
+        return 2
+    fi
+    if printf '%s\n' "$out" | grep -F "${portset}" | grep -q -F -- "${ip}"; then
+        return 0
+    fi
+    return 1
 }
 
 # =============================================================================
@@ -2642,10 +3065,8 @@ storage_setup_ibm() {
         if [[ "$DRY_RUN" == "true" ]]; then
             log "[DRY-RUN] Would create portset: svctask mkportset -name ${portset_name} -type host"
         else
-            storage_ssh ibm "svctask mkportset -name ${portset_name} -type host" 2>/dev/null || {
-                log_error "  Failed to create portset ${portset_name}"
-                return 1
-            }
+            storage_apply ibm "Failed to create portset ${portset_name}" \
+                "svctask mkportset -name ${portset_name} -type host" || return 1
             log_success "  Portset ${portset_name} created"
         fi
     fi
@@ -2682,24 +3103,39 @@ storage_setup_ibm() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create: svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}"
             else
-                storage_ssh ibm "svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}" 2>/dev/null || {
-                    log_error "  Failed to create IP ${ip} on ${node}:port${port}"
-                    continue
-                }
+                storage_apply ibm "Failed to create IP ${ip} on ${node}:port${port}" \
+                    "svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}" || return 1
                 log_success "  IP ${ip} created on ${node}:port${port} (VLAN ${vlan})"
             fi
         fi
         portal_ips+=("$ip")
 
-        # Add to portset
-        local member_check
-        member_check=$(storage_ssh ibm "svcinfo lsportsetmember -delim : ${portset_name}" 2>/dev/null | grep -c "${ip}" || true)
-        if [[ "$member_check" -eq 0 ]]; then
+        # Add to portset. lsip is the membership source; lsportsetmember is not a command here.
+        local member_status=0
+        ibm_portset_has_ip "$portset_name" "$ip" || member_status=$?
+        if [[ "$member_status" -eq 2 ]]; then
+            return 1
+        fi
+        if [[ "$member_status" -ne 0 ]]; then
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would add: svctask addportsetmember -portset ${portset_name} -ip ${ip}"
             else
-                storage_ssh ibm "svctask addportsetmember -portset ${portset_name} -ip ${ip}" 2>/dev/null || true
-                log "  Added ${ip} to portset ${portset_name}"
+                local add_out="" add_status=0 again=0 line
+                add_out=$(storage_ssh ibm "svctask addportsetmember -portset ${portset_name} -ip ${ip}" 2>&1) || add_status=$?
+                if [[ "$add_status" -ne 0 ]]; then
+                    ibm_portset_has_ip "$portset_name" "$ip" || again=$?
+                    if [[ "$again" -eq 0 ]]; then
+                        log_success "  IP ${ip} already in portset ${portset_name}"
+                    else
+                        log_error "  Failed to add ${ip} to portset ${portset_name}"
+                        while IFS= read -r line; do
+                            [[ -n "$line" ]] && log "    ${line}"
+                        done <<< "$add_out"
+                        return 1
+                    fi
+                else
+                    log "  Added ${ip} to portset ${portset_name}"
+                fi
             fi
         fi
     done
@@ -2723,76 +3159,18 @@ storage_setup_ibm() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create: svctask mkvdisk -mdiskgrp Pool0 -iogrp io_grp0 -size ${ibm_num} -unit ${ibm_unit} -name ${vdisk_name}"
             else
-                storage_ssh ibm "svctask mkvdisk -mdiskgrp Pool0 -iogrp io_grp0 -size ${ibm_num} -unit ${ibm_unit} -name ${vdisk_name}" 2>/dev/null || {
-                    log_error "  Failed to create vdisk ${vdisk_name}"
-                    continue
-                }
+                storage_apply ibm "Failed to create vdisk ${vdisk_name}" \
+                    "svctask mkvdisk -mdiskgrp Pool0 -iogrp io_grp0 -size ${ibm_num} -unit ${ibm_unit} -name ${vdisk_name}" || return 1
                 log_success "  vdisk ${vdisk_name} created (${LUN_SIZE})"
             fi
         fi
     done
 
-    # --- Sub-stage C: Hosts ---
-    log "  [C] Creating host objects..."
-    for pair in "${iqn_pairs[@]}"; do
-        local worker_name="${pair%%:*}"
-        local iqn="${pair#*:}"
-        local host_name="${cloud_name}_${worker_name}"
-
-        local host_check
-        host_check=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | grep -c "${host_name}" || true)
-        if [[ "$host_check" -gt 0 ]]; then
-            log_success "  Host ${host_name} already exists"
-            # Ensure host is in the correct portset (may differ if created by a prior run)
-            if [[ "$DRY_RUN" != "true" ]]; then
-                local cur_portset
-                cur_portset=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | awk '/^portset_name /{print $2}')
-                if [[ "$cur_portset" != "${portset_name}" ]]; then
-                    storage_ssh ibm "svctask chhost -portset ${portset_name} ${host_name}" 2>/dev/null || true
-                    log "    Moved ${host_name} from portset '${cur_portset}' → '${portset_name}'"
-                fi
-            fi
-        else
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}"
-            else
-                storage_ssh ibm "svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}" 2>/dev/null || {
-                    log_error "  Failed to create host ${host_name}"
-                    continue
-                }
-                log_success "  Host ${host_name} created (IQN: ${iqn})"
-            fi
-        fi
-    done
-
-    # --- Sub-stage D: LUN mapping ---
-    log "  [D] Mapping vdisk(s) to hosts..."
-    for (( i=1; i<=LUN_COUNT; i++ )); do
-        local vdisk_name
-        vdisk_name=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
-        local scsi_id=$(( i - 1 ))
-
-        for pair in "${iqn_pairs[@]}"; do
-            local worker_name="${pair%%:*}"
-            local host_name="${cloud_name}_${worker_name}"
-
-            local map_check
-            map_check=$(storage_ssh ibm "svcinfo lshostvdiskmap ${host_name}" 2>/dev/null | grep -c "${vdisk_name}" || true)
-            if [[ "$map_check" -gt 0 ]]; then
-                log_success "  vdisk ${vdisk_name} already mapped to ${host_name}"
-            else
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}"
-                else
-                    storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}" 2>/dev/null || {
-                        log_error "  Failed to map ${vdisk_name} to ${host_name}"
-                        continue
-                    }
-                    log_success "  vdisk ${vdisk_name} mapped to ${host_name} (scsi ${scsi_id})"
-                fi
-            fi
-        done
-    done
+    # --- Sub-stages C and D: adopt the host that already owns the IQN, then map ---
+    log "  [C] Resolving host objects by IQN..."
+    log "  [D] Mapping vdisk(s) at a free SCSI id..."
+    local bind_status=0
+    ibm_bind_hosts "$cloud_name" "$portset_name" "${iqn_pairs[@]}" || bind_status=$?
 
     # Verify final state
     log "  Verifying final state..."
@@ -2802,6 +3180,10 @@ storage_setup_ibm() {
     verify_ip=$(storage_ssh ibm "svcinfo lsip -delim :" 2>/dev/null | grep -E "$(IFS='|'; echo "${portal_ips[*]}")" || true)
     echo "$verify_ip" | while IFS= read -r line; do [[ -n "$line" ]] && log "    IP: $line"; done || true
 
+    if [[ "$bind_status" -ne 0 ]]; then
+        log_error "  IBM host mapping failed for one or more hosts"
+        return 1
+    fi
     log_success "  IBM storage-setup complete for ${cloud_name}"
 }
 
@@ -2816,6 +3198,8 @@ storage_setup_netapp_aff() {
 
     log ""
     log "--- NetApp AFF A300: storage-setup for ${cloud_name} ---"
+    local os_type
+    os_type=$(storage_target_ostype)
 
     local svm="svm_${cloud_name}"
     local ipspace="ipspace_${cloud_name}"
@@ -2858,7 +3242,8 @@ storage_setup_netapp_aff() {
         if [[ "$ipspace_check" -gt 0 ]]; then
             log_success "  IPspace ${ipspace} already exists"
         else
-            storage_ssh netapp-aff "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace creation failed (may already exist)"
+            storage_apply netapp-aff "Failed to create IPspace ${ipspace}" \
+                "ipspace create -ipspace ${ipspace}" || return 1
             log_success "  IPspace ${ipspace} created"
         fi
 
@@ -2872,7 +3257,8 @@ storage_setup_netapp_aff() {
             if [[ "$bd_check" -gt 0 ]]; then
                 log_success "  Broadcast domain ${bd} already exists"
             else
-                storage_ssh netapp-aff "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || log_warn "  Broadcast domain ${bd} creation failed"
+                storage_apply netapp-aff "Failed to create broadcast domain ${bd}" \
+                    "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" || return 1
                 log_success "  Broadcast domain ${bd} created"
             fi
         done
@@ -2891,14 +3277,16 @@ storage_setup_netapp_aff() {
                 cur_bd=$(storage_ssh netapp-aff "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
                 if [[ -z "$cur_bd" ]]; then
                     # VLAN port doesn't exist yet — create it (auto-assigned to a Default-ipspace domain)
-                    storage_ssh netapp-aff "network port vlan create -node ${node} -vlan-name ${vp}" 2>/dev/null || log_warn "  VLAN port ${node}:${vp} creation failed"
+                    storage_apply netapp-aff "Failed to create VLAN port ${node}:${vp}" \
+                        "network port vlan create -node ${node} -vlan-name ${vp}" || return 1
                     log_success "  VLAN port ${node}:${vp} created"
                 elif [[ "$cur_bd" == "$target_bd" ]]; then
                     log_verbose "  ${node}:${vp} already in ${target_bd}"
                     continue
                 elif [[ "$cur_bd" != "-" ]]; then
                     log "  Moving ${node}:${vp} from ${cur_bd} to ${target_bd}"
-                    storage_ssh netapp-aff "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                    storage_apply netapp-aff "Failed to remove ${node}:${vp} from ${cur_bd}" \
+                        "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" || return 1
                 fi
                 if [[ "$target_bd" == "$bd_a" ]]; then
                     add_a+=("${node}:${vp}")
@@ -2909,13 +3297,15 @@ storage_setup_netapp_aff() {
         done
 
         if (( ${#add_a[@]} > 0 )); then
-            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_a}"
+            storage_apply netapp-aff "Failed to add ports to ${bd_a}" \
+                "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" || return 1
             log_success "  Ports added to ${bd_a}"
         else
             log_success "  Path-A ports already homed in ${bd_a}"
         fi
         if (( ${#add_b[@]} > 0 )); then
-            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_b}"
+            storage_apply netapp-aff "Failed to add ports to ${bd_b}" \
+                "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" || return 1
             log_success "  Ports added to ${bd_b}"
         else
             log_success "  Path-B ports already homed in ${bd_b}"
@@ -2927,7 +3317,8 @@ storage_setup_netapp_aff() {
         if [[ "$svm_exists" -gt 0 ]]; then
             log_success "  SVM ${svm} already exists"
         else
-            storage_ssh netapp-aff "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || true
+            storage_apply netapp-aff "Failed to create SVM ${svm}" \
+                "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" || return 1
             log_success "  SVM ${svm} created"
         fi
 
@@ -2937,7 +3328,8 @@ storage_setup_netapp_aff() {
         if [[ "$iscsi_check" -gt 0 ]]; then
             log_success "  iSCSI service already enabled on ${svm}"
         else
-            storage_ssh netapp-aff "vserver iscsi create -vserver ${svm}" 2>/dev/null || log_warn "  iSCSI service creation failed"
+            storage_apply netapp-aff "Failed to enable iSCSI on ${svm}" \
+                "vserver iscsi create -vserver ${svm}" || return 1
             log "  iSCSI service enabled on ${svm}"
         fi
 
@@ -2954,10 +3346,14 @@ storage_setup_netapp_aff() {
             done || true
         else
             log "  Creating LIFs (found ${lif_count}/4)..."
-            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node1}_a" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node2}_a" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node1}_b" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" || return 1
+            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node2}_b" \
+                "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" || return 1
             log_success "  LIF creation commands issued"
         fi
     fi
@@ -2976,16 +3372,21 @@ storage_setup_netapp_aff() {
             log_success "  Volume ${vol_name} already exists"
             # Ensure snapshot reserve is 0 for LUN volumes (may have been created with default 5%)
             if [[ "$DRY_RUN" != "true" ]]; then
-                storage_ssh netapp-aff "volume modify -vserver ${svm} -volume ${vol_name} -percent-snapshot-space 0" 2>/dev/null || true
+                local snap_out="" snap_status=0 snap_line
+                snap_out=$(storage_ssh netapp-aff "volume modify -vserver ${svm} -volume ${vol_name} -percent-snapshot-space 0" 2>&1) || snap_status=$?
+                if [[ "$snap_status" -ne 0 ]]; then
+                    log_warn "  Could not set snapshot reserve to 0 on ${vol_name}"
+                    while IFS= read -r snap_line; do
+                        [[ -n "$snap_line" ]] && log "    ${snap_line}"
+                    done <<< "$snap_out"
+                fi
             fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create volume: volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0"
             else
-                storage_ssh netapp-aff "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0" 2>/dev/null || {
-                    log_error "  Failed to create volume ${vol_name}"
-                    continue
-                }
+                storage_apply netapp-aff "Failed to create volume ${vol_name}" \
+                    "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0" || return 1
                 log_success "  Volume ${vol_name} created"
             fi
         fi
@@ -2994,14 +3395,13 @@ storage_setup_netapp_aff() {
         lun_check=$(storage_ssh netapp-aff "lun show -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -fields lun" 2>/dev/null | grep -c "${lun_name}" || true)
         if [[ "$lun_check" -gt 0 ]]; then
             log_success "  LUN ${lun_name} already exists"
+            netapp_log_ostype netapp-aff "LUN ${lun_name}" "lun show -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -fields ostype"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled"
+                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype ${os_type} -space-reserve disabled"
             else
-                storage_ssh netapp-aff "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled" 2>/dev/null || {
-                    log_error "  Failed to create LUN ${lun_name}"
-                    continue
-                }
+                storage_apply netapp-aff "Failed to create LUN ${lun_name}" \
+                    "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype ${os_type} -space-reserve disabled" || return 1
                 log_success "  LUN ${lun_name} created (${LUN_SIZE})"
             fi
         fi
@@ -3022,23 +3422,23 @@ storage_setup_netapp_aff() {
 
     if [[ "$ig_check" -gt 0 ]]; then
         log_success "  igroup ${ig_name} already exists"
+        netapp_log_ostype netapp-aff "igroup ${ig_name}" "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields ostype"
         for pair in "${iqn_pairs[@]}"; do
             local iqn="${pair#*:}"
             local already
             already=$(storage_ssh netapp-aff "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields initiator" 2>/dev/null | grep -c "$iqn" || true)
             if [[ "$already" -eq 0 && "$DRY_RUN" != "true" ]]; then
-                storage_ssh netapp-aff "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" 2>/dev/null || true
+                storage_apply netapp-aff "Failed to add initiator ${iqn} to ${ig_name}" \
+                    "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" || return 1
                 log "  Added initiator ${iqn} to ${ig_name}"
             fi
         done
     else
         if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create igroup ${ig_name} with initiators: ${iqn_list}"
+            log "[DRY-RUN] Would create igroup ${ig_name} -ostype ${os_type} with initiators: ${iqn_list}"
         elif [[ -n "$iqn_list" ]]; then
-            storage_ssh netapp-aff "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype linux -initiator ${iqn_list}" 2>/dev/null || {
-                log_error "  Failed to create igroup ${ig_name}"
-                return 1
-            }
+            storage_apply netapp-aff "Failed to create igroup ${ig_name}" \
+                "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype ${os_type} -initiator ${iqn_list}" || return 1
             log_success "  igroup ${ig_name} created with ${#iqn_pairs[@]} initiators"
         else
             log_warn "  No IQNs collected — skipping igroup creation"
@@ -3062,16 +3462,162 @@ storage_setup_netapp_aff() {
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would map: lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}"
             else
-                storage_ssh netapp-aff "lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}" 2>/dev/null || {
-                    log_error "  Failed to map LUN ${lun_path}"
-                    continue
-                }
+                storage_apply netapp-aff "Failed to map LUN ${lun_path}" \
+                    "lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}" || return 1
                 log_success "  LUN ${lun_path} mapped to ${ig_name} (lun-id ${lun_id})"
             fi
         fi
     done
 
     log_success "  NetApp AFF A300 storage-setup complete for ${cloud_name}"
+}
+
+# True when every portal address has a logged_in iSCSI session.
+vmware_portals_logged_in() {
+    local text="$1"
+    shift
+    local addr ip
+    for addr in "$@"; do
+        ip="${addr%%:*}"
+        if ! printf '%s\n' "$text" | awk -v ip="$ip" '
+            function ip_re(value,    escaped) {
+                escaped = value
+                gsub(/\./, "\\.", escaped)
+                return "(^|[^0-9])" escaped "([^0-9]|$)"
+            }
+            BEGIN { ok = 0; cur = 0; re = ip_re(ip) }
+            $0 ~ re && $0 ~ /logged_in/ { ok = 1 }
+            /^[[:space:]]*RemoteAddress:/ {
+                addr = $0
+                sub(/^[[:space:]]*RemoteAddress:[[:space:]]*/, "", addr)
+                cur = (addr ~ re)
+            }
+            /^[[:space:]]*State:/ {
+                if (cur && $0 ~ /logged_in/) ok = 1
+                cur = 0
+            }
+            END { exit ok ? 0 : 1 }
+        '; then
+            return 1
+        fi
+    done
+}
+
+# Add missing send targets, rediscover once, then wait for logged_in.
+# Dry-run logs the add and rediscover commands and does not run them.
+# Rediscover is supposed to print "Rediscovery started" and return. If it does
+# not return within 60s, this returns 2 so the caller stops before the next host.
+# A logged_in poll that expires returns 1. The caller keeps checking other hosts.
+vmware_discover_host() {
+    local ipath="$1"
+    shift
+    local -a addrs=("$@")
+    local adapter="$VMWARE_ISCSI_ADAPTER"
+
+    log ""
+    log "  === ESXi discovery on ${ipath} ==="
+
+    if (( ${#addrs[@]} == 0 )); then
+        log_error "  ${ipath}: no portal addresses to discover"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local addr
+        for addr in "${addrs[@]}"; do
+            vmware_esxcli write "$ipath" iscsi adapter discovery sendtarget add -A "$adapter" -a "$addr"
+        done
+        vmware_esxcli write "$ipath" iscsi adapter discovery rediscover -A "$adapter"
+        return 0
+    fi
+
+    local list_out="" list_status=0
+    list_out=$(vmware_esxcli read "$ipath" iscsi adapter discovery sendtarget list 2>&1) || list_status=$?
+    if [[ "$list_status" -ne 0 ]]; then
+        log_error "  ${ipath}: sendtarget list failed: $(printf '%s\n' "$list_out" | vmware_redact)"
+        return 1
+    fi
+
+    local addr
+    for addr in "${addrs[@]}"; do
+        if printf '%s\n' "$list_out" | grep -F -q -- "$addr"; then
+            log "  ${ipath}: send target ${addr} already listed"
+            continue
+        fi
+        local add_out="" add_status=0
+        add_out=$(vmware_esxcli write "$ipath" iscsi adapter discovery sendtarget add -A "$adapter" -a "$addr" 2>&1) || add_status=$?
+        if [[ "$add_status" -eq 0 ]]; then
+            log_success "  ${ipath}: added send target ${addr}"
+            continue
+        fi
+        if [[ -n "$add_out" ]]; then
+            log "    ${add_out}"
+        fi
+        local again
+        again=$(vmware_esxcli read "$ipath" iscsi adapter discovery sendtarget list 2>&1 || true)
+        if printf '%s\n' "$again" | grep -F -q -- "$addr"; then
+            log_success "  ${ipath}: send target ${addr} already listed"
+            continue
+        fi
+        log_error "  ${ipath}: failed to add send target ${addr}"
+        return 1
+    done
+
+    local rd_out="" rd_status=0 rd_line
+    rd_out=$(vmware_esxcli_bounded 60 "$ipath" iscsi adapter discovery rediscover -A "$adapter" 2>&1) || rd_status=$?
+    while IFS= read -r rd_line; do
+        [[ -n "$rd_line" ]] && log "    ${rd_line}"
+    done <<< "$rd_out"
+    if [[ "$rd_status" -ne 0 ]]; then
+        if [[ "$rd_status" -eq 124 ]]; then
+            log_error "  ${ipath}: rediscover did not return within 60s"
+        else
+            log_error "  ${ipath}: rediscover failed"
+        fi
+        return 2
+    fi
+
+    local start=$SECONDS sessions
+    while true; do
+        sessions=$(vmware_esxcli read "$ipath" iscsi session connection list 2>&1 || true)
+        if vmware_portals_logged_in "$sessions" "${addrs[@]}"; then
+            log_success "  ${ipath}: logged_in to ${addrs[*]}"
+            return 0
+        fi
+        if (( SECONDS - start >= 60 )); then
+            log_error "  ${ipath}: timed out after 60s waiting for logged_in sessions"
+            return 1
+        fi
+        sleep 5
+    done
+}
+
+storage_discovery_vmware() {
+    vmware_preflight || return 1
+
+    local hosts_out="" sel_status=0
+    hosts_out=$(vmware_selected_hosts) || sel_status=$?
+    if [[ "$sel_status" -ne 0 || -z "$hosts_out" ]]; then
+        return 1
+    fi
+
+    local -a selected=()
+    mapfile -t selected <<< "$hosts_out"
+
+    local failed=0 ipath rc
+    for ipath in "${selected[@]}"; do
+        rc=0
+        vmware_discover_host "$ipath" "$@" || rc=$?
+        if [[ "$rc" -eq 2 ]]; then
+            return 1
+        fi
+        if [[ "$rc" -ne 0 ]]; then
+            failed=1
+        fi
+    done
+    if [[ "$failed" -ne 0 ]]; then
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -3099,6 +3645,18 @@ storage_discovery_and_verify() {
             fi
         done
     done < <(compute_vlan_layout)
+
+    if [[ "$TARGET_TYPE" == "vmware" ]]; then
+        local -a portal_addrs=()
+        local vendor portal_ip
+        for vendor in "${vendors_to_discover[@]}"; do
+            for portal_ip in ${vendor_portals[$vendor]:-}; do
+                portal_addrs+=("${portal_ip}:3260")
+            done
+        done
+        storage_discovery_vmware "${portal_addrs[@]}" || return 1
+        return 0
+    fi
 
     # Get OCP worker list
     local -a workers=()
@@ -3230,14 +3788,37 @@ do_storage_setup() {
     log "Volume/LUN configuration: size=${LUN_SIZE}, count=${LUN_COUNT}"
     log ""
 
-    # Collect IQNs from workers
+    # Collect IQNs from workers. VMware reads govc on a dry-run too.
+    # OCP and bare dry-runs keep the placeholder and do not touch a host.
     log "Collecting iSCSI initiator IQNs from workers..."
     local -a iqn_pairs=()
-    if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ "$DRY_RUN" == "true" && "$TARGET_TYPE" != "vmware" ]]; then
         log "[DRY-RUN] Would collect IQNs from workers via oc debug"
         iqn_pairs=("worker-dry-run:iqn.2026-01.com.example:dry-run")
     else
-        mapfile -t iqn_pairs < <(collect_worker_iqns)
+        local iqn_output="" collect_status=0 pair
+        iqn_output=$(collect_worker_iqns) || collect_status=$?
+        if [[ "$collect_status" -ne 0 ]]; then
+            log_error "Failed to collect iSCSI initiator IQNs"
+            return 1
+        fi
+        if [[ -n "$iqn_output" ]]; then
+            mapfile -t iqn_pairs <<< "$iqn_output"
+        fi
+        local -a kept=()
+        if (( ${#iqn_pairs[@]} > 0 )); then
+            for pair in "${iqn_pairs[@]}"; do
+                [[ -n "$pair" ]] && kept+=("$pair")
+            done
+        fi
+        iqn_pairs=()
+        if (( ${#kept[@]} > 0 )); then
+            iqn_pairs=("${kept[@]}")
+        fi
+        if (( ${#iqn_pairs[@]} == 0 )); then
+            log_error "No iSCSI initiator IQNs collected"
+            return 1
+        fi
     fi
     log "Collected ${#iqn_pairs[@]} IQN(s)"
     log ""
@@ -3245,21 +3826,30 @@ do_storage_setup() {
     local -a vendors_arr
     read -r -a vendors_arr <<< "$STORAGE_ARRAYS"
 
-    # A vendor returning non-zero must not abort the shell: later vendors
-    # and discovery still run, and the stage exits non-zero at the end.
+    # A failed vendor does not skip the vendors after it. Sub-stage E
+    # receives only the vendors that returned 0.
     local setup_failed=0
+    local -a discover_vendors=()
+    local vendor vendor_rc
     for vendor in "${vendors_arr[@]}"; do
+        vendor_rc=0
         case "$vendor" in
-            netapp-asa)  storage_setup_netapp_asa  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
-            pure)        storage_setup_pure         "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
-            ibm)         storage_setup_ibm          "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
-            netapp-aff)  storage_setup_netapp_aff  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || setup_failed=1 ;;
-            *)           log_warn "Unknown vendor '${vendor}' — skipping storage-setup" ;;
+            netapp-asa)  storage_setup_netapp_asa  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || vendor_rc=$? ;;
+            pure)        storage_setup_pure         "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || vendor_rc=$? ;;
+            ibm)         storage_setup_ibm          "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || vendor_rc=$? ;;
+            netapp-aff)  storage_setup_netapp_aff  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" || vendor_rc=$? ;;
+            *)           log_warn "Unknown vendor '${vendor}' — skipping storage-setup"; continue ;;
         esac
+        if [[ "$vendor_rc" -ne 0 ]]; then
+            setup_failed=1
+        else
+            discover_vendors+=("$vendor")
+        fi
     done
 
-    # Sub-stage E: Discovery + verification
-    storage_discovery_and_verify "$cloud_name" "${vendors_arr[@]}"
+    if (( ${#discover_vendors[@]} > 0 )); then
+        storage_discovery_and_verify "$cloud_name" "${discover_vendors[@]}" || setup_failed=1
+    fi
 
     log ""
     if [[ "$setup_failed" -ne 0 ]]; then
