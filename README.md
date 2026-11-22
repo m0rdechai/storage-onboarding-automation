@@ -38,12 +38,12 @@ The script runs in stages that can be executed individually or all at once:
 | `collect` | Query the QUADS API, extract host/interface/MAC data to `results/` |
 | `verify` | Check that target interfaces aren't already assigned to cloud99 |
 | `jira-draft` | Generate a VLAN-change Jira request for ScaleLab ops |
-| `host-setup` | Create VLAN sub-interfaces (NNCPs on OCP) and the iSCSI initiator. On OCP, install multipath.conf with a worker MachineConfig |
+| `host-setup` | Create storage VLAN interfaces: NNCPs on OCP, nmcli on bare metal, govc portgroups and DHCP vmkernels on the ESXi hosts under `VMWARE_HOST_FOLDER`. On OCP, install multipath.conf with a worker MachineConfig |
 | `storage-setup` | Configure storage arrays: portals, volumes, hosts, LUN mappings |
 | `check` | Verify connectivity from workers to storage portal IPs |
 | `all` | Run all stages in order |
 
-On OpenShift, `host-setup` installs [`files/multipath.conf`](files/multipath.conf) as `/etc/multipath.conf` with one MachineConfig on the worker pool, and enables `multipathd`. A new or changed MachineConfig reboots every worker. `-w` limits the per-node iSCSI step only. The rollout wait is `MCP_WAIT_TIMEOUT` seconds (default 3600). Bare metal and VMware receive the same file over SSH.
+On OpenShift, `host-setup` installs [`files/multipath.conf`](files/multipath.conf) as `/etc/multipath.conf` with one MachineConfig on the worker pool, and enables `multipathd`. A new or changed MachineConfig reboots every worker. `-w` limits the per-node iSCSI step only. The rollout wait is `MCP_WAIT_TIMEOUT` seconds (default 3600). Bare metal installs the same file over SSH. VMware host-setup uses `govc` under `VMWARE_HOST_FOLDER` and does not install that file. ESXi has no `/etc/multipath.conf`.
 
 ### `storage-setup` Sub-stages
 
@@ -89,13 +89,19 @@ STORAGE_ARRAYS="netapp-asa pure"
 Optional settings with defaults:
 
 ```bash
-NETWORKS="3 4"          # BIOS-level NIC numbers (em3, em4)
+NETWORKS="3 4"          # BIOS-level NIC numbers (em3, em4); not used for vmware
 TARGET_TYPE="ocp"       # ocp | vmware | bare
-SSH_USER="core"         # auto-set from TARGET_TYPE
+SSH_USER="core"         # auto-set from TARGET_TYPE for ocp and bare
 LUN_SIZE="1TB"          # size per volume/LUN per vendor
 LUN_COUNT=1             # number of volumes/LUNs per vendor
-EXCLUDE_HOSTS=""        # space-separated hostnames to skip
+EXCLUDE_HOSTS=""        # space-separated names to skip; for vmware, matched against the vCenter path
 MCP_WAIT_TIMEOUT=3600   # seconds to wait for the worker MachineConfigPool rollout
+# VMWARE_HOST_FOLDER="/Perf/host/MTV"   # vmware host-setup lists HostSystems here
+# VMWARE_HOST_DOMAIN is not used to select hosts.
+# VMWARE_HOST_ALIAS is not used to select hosts.
+# VMWARE_HOST_MAP=""              # hostname=uplinkA:uplinkB
+# VMWARE_ANCHOR_VSWITCH="vSwitch2"
+# VMWARE_VM_PORTGROUP="VM Network"
 ```
 
 See `env/example.env` for a fully commented template.
@@ -123,6 +129,7 @@ On the provisioner node:
 - `jq`, `sshpass`, `curl`
 - `bws` CLI (Bitwarden Secrets Manager) with `BWS_ACCESS_TOKEN` set
 - `oc` (for OCP target type) with a valid KUBECONFIG
+- `govc` (for `TARGET_TYPE=vmware`) with `GOVC_URL`, `GOVC_USERNAME`, `GOVC_PASSWORD`, and `GOVC_INSECURE` set in the shell. Those values are not read from the env file. VMware host-setup lists hosts with `govc find -type h` under `VMWARE_HOST_FOLDER` and does not use the QUADS cloud list.
 
 ## Project Structure
 

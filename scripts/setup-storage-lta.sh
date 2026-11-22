@@ -39,6 +39,17 @@ SSH_USER=""
 QUADS_API="https://quads2.rdu2.scalelab.redhat.com/api/v3"
 CLOUD99_OUTER_VLAN="2080"
 
+# ESXi host-setup (TARGET_TYPE=vmware). The host list is
+# `govc find -type h` of VMWARE_HOST_FOLDER. GOVC_* stays in the shell.
+# VMWARE_HOST_DOMAIN and VMWARE_HOST_ALIAS are not used to select hosts.
+VMWARE_HOST_FOLDER="/Perf/host/MTV"
+VMWARE_HOST_DOMAIN=".rdu2.scalelab.redhat.com"
+VMWARE_HOST_ALIAS=""
+VMWARE_HOST_MAP=""
+VMWARE_ANCHOR_VSWITCH="vSwitch2"
+VMWARE_VM_PORTGROUP="VM Network"
+VMWARE_ISCSI_ADAPTER="vmhba64"
+
 # Volume / LUN configuration for storage-setup stage
 LUN_SIZE="1TB"
 LUN_COUNT=1
@@ -92,7 +103,8 @@ IFACE_OS_MAP=(
 # Multipath configuration
 # One file for every vendor (files/multipath.conf): IBM and Pure device
 # blocks, NetApp on the built-in ONTAP profile. OpenShift installs it with a
-# worker MachineConfig. Bare metal and VMware write the same file over SSH.
+# worker MachineConfig. Bare metal writes the same file over SSH.
+# VMware does not: ESXi has no /etc/multipath.conf.
 # =============================================================================
 MULTIPATH_CONF_FILE="${REPO_DIR}/files/multipath.conf"
 
@@ -317,7 +329,8 @@ resolve_os_iface() {
 #   - multipath.conf  → MachineConfig on the worker MachineConfigPool
 #   - Host commands   → oc debug node/<name> -- chroot /host <cmd>
 #
-# Bare-metal / VMware hosts use direct SSH + nmcli.
+# Bare-metal hosts use direct SSH + nmcli.
+# VMware hosts use govc host.esxcli. Do not SSH to ESXi.
 # =============================================================================
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
 
@@ -533,11 +546,14 @@ HEADER
 # =============================================================================
 # STAGE: host-setup
 #
-# Two paths depending on TARGET_TYPE:
-#   ocp  → NNCP YAMLs for VLAN interfaces, applied via oc apply;
-#          /etc/multipath.conf via one worker MachineConfig, then wait for
-#          mcp/worker; iSCSI initiator via oc debug after the pool rolls
-#   bare/vmware → SSH + nmcli for VLANs, SSH for iSCSI and multipath.conf
+# Three paths depending on TARGET_TYPE:
+#   ocp    → NNCP YAMLs for VLAN interfaces, applied via oc apply;
+#            /etc/multipath.conf via one worker MachineConfig, then wait for
+#            mcp/worker; iSCSI initiator via oc debug after the pool rolls
+#   vmware → hosts from `govc find -type h` of VMWARE_HOST_FOLDER, then
+#            host.esxcli portgroups, vmkernel DHCP, iSCSI portal bind.
+#            ESXi has no /etc/multipath.conf and is not reached over SSH.
+#   bare   → SSH + nmcli for VLANs, SSH for iSCSI and multipath.conf
 # =============================================================================
 
 # ---- OCP: Generate NNCP YAML for a single VLAN interface --------------------
@@ -928,7 +944,7 @@ setup_multipath_ocp() {
     wait_for_worker_mcp "$mc_name" "$pool"
 }
 
-# ---- Bare-metal / VMware: VLAN interfaces via SSH + nmcli --------------------
+# ---- Bare-metal: VLAN interfaces via SSH + nmcli -----------------------------
 setup_vlan_interfaces_ssh() {
     local worker="$1"
     local model="$2"
@@ -1059,6 +1075,669 @@ echo UPDATED"
     fi
 }
 
+# ---- VMware: govc host.esxcli ------------------------------------------------
+# On this esxcli, -u means --use-vswitch. Pin with -active-uplinks and an
+# empty -standby-uplinks. Do not pass -u.
+
+vmware_redact() { sed -E 's#://[^[:space:]/@]*@#://#g'; }
+
+vmware_preflight() {
+    if ! command -v govc >/dev/null 2>&1; then
+        log_error "govc not found on PATH"
+        return 1
+    fi
+    local about
+    if ! about=$(govc about 2>&1); then
+        log_error "govc about failed: $(printf '%s\n' "$about" | vmware_redact)"
+        return 1
+    fi
+    if [[ -z "$about" ]]; then
+        log_error "govc about returned an empty result"
+        return 1
+    fi
+    local full
+    full=$(printf '%s\n' "$about" | awk -F: '/^FullName:/ {sub(/^[ \t]+/, "", $2); print $2; exit}')
+    log "govc about ok: ${full:-reachable}"
+}
+
+# One sorted inventory path per HostSystem under VMWARE_HOST_FOLDER.
+vmware_list_hosts() {
+    local out paths
+    if ! out=$(govc find -type h "${VMWARE_HOST_FOLDER}" 2>&1); then
+        log_error "govc find failed for ${VMWARE_HOST_FOLDER}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    paths=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; s/[[:space:]]*$//; /^\/.*\/[^/]/p' | sort)
+    if [[ -z "$paths" ]]; then
+        log_error "No ESXi hosts under ${VMWARE_HOST_FOLDER}"
+        return 1
+    fi
+    printf '%s\n' "$paths"
+}
+
+# First DNS label of a vCenter inventory path, for VMWARE_HOST_MAP.
+vmware_short_name() {
+    local base="${1##*/}"
+    printf '%s\n' "${base%%.*}"
+}
+
+vmware_pg_name() {
+    local vendor="$1" path="$2"
+    case "${vendor}:${path}" in
+        ibm:A) echo ibm ;;
+        ibm:B) echo ibm2 ;;
+        netapp-asa:A) echo netapp-asa ;;
+        netapp-asa:B) echo netapp-asa2 ;;
+        pure:A) echo pure ;;
+        pure:B) echo pure2 ;;
+        netapp-aff:A) echo netapp-aff ;;
+        netapp-aff:B) echo netapp-aff2 ;;
+        *)
+            log_error "No ESXi portgroup name for vendor '${vendor}'"
+            return 1
+            ;;
+    esac
+}
+
+vmware_esxcli() {
+    local mode="$1" ipath="$2"
+    shift 2
+    if [[ "$mode" == "write" && "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would run: govc host.esxcli -host.ipath ${ipath} $*"
+        return 0
+    fi
+    log_verbose "govc host.esxcli -host.ipath ${ipath} $*"
+    govc host.esxcli -host.ipath "$ipath" "$@"
+}
+
+vmware_reset_caches() {
+    declare -gA VMW_PG_VS=()
+    declare -gA VMW_PG_VLAN=()
+    declare -gA VMW_VMK_PG=()
+    declare -gA VMW_VMK_MTU=()
+    declare -gA VMW_VMK_IP=()
+    declare -gA VMW_PORTAL=()
+}
+
+vmware_load_portgroups() {
+    local ipath="$1" out
+    if ! out=$(vmware_esxcli read "$ipath" network vswitch standard portgroup list 2>&1); then
+        log_error "  portgroup list failed for ${ipath}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    local name vs vlan
+    while IFS=$'\t' read -r name vs vlan; do
+        [[ -z "$name" ]] && continue
+        VMW_PG_VS["$name"]="$vs"
+        VMW_PG_VLAN["$name"]="$vlan"
+    done < <(printf '%s\n' "$out" | python3 -c '
+import sys
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line.strip() or line.startswith("Name"):
+        continue
+    if set(line.strip()) <= set("- "):
+        continue
+    parts = line.rsplit(None, 3)
+    if len(parts) != 4 or not parts[3].isdigit():
+        continue
+    print("%s\t%s\t%s" % (parts[0], parts[1], parts[3]))
+')
+}
+
+vmware_load_vmks() {
+    local ipath="$1" out name pg mtu
+    if ! out=$(vmware_esxcli read "$ipath" network ip interface list 2>&1); then
+        log_error "  interface list failed for ${ipath}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    VMW_VMK_PG=()
+    VMW_VMK_MTU=()
+    while IFS=$'\t' read -r name pg mtu; do
+        [[ -z "$name" ]] && continue
+        VMW_VMK_PG["$name"]="$pg"
+        VMW_VMK_MTU["$name"]="$mtu"
+    done < <(printf '%s\n' "$out" | python3 -c '
+import sys
+for block in sys.stdin.read().split("\n\n"):
+    name = pg = mtu = None
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key, val = key.strip(), val.strip()
+        if key == "Name":
+            name = val
+        elif key == "Portgroup":
+            pg = val
+        elif key == "MTU":
+            mtu = val
+    if name and name.startswith("vmk"):
+        print("%s\t%s\t%s" % (name, pg or "", mtu or ""))
+')
+    vmware_load_ips "$ipath"
+}
+
+vmware_load_ips() {
+    local ipath="$1" out name ip
+    if ! out=$(vmware_esxcli read "$ipath" network ip interface ipv4 get 2>&1); then
+        log_error "  ipv4 get failed for ${ipath}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    VMW_VMK_IP=()
+    while read -r name ip _; do
+        [[ "$name" == vmk* ]] || continue
+        VMW_VMK_IP["$name"]="$ip"
+    done <<< "$out"
+}
+
+vmware_load_portals() {
+    local ipath="$1" out name status
+    if ! out=$(vmware_esxcli read "$ipath" iscsi networkportal list 2>&1); then
+        log_error "  iscsi networkportal list failed: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    VMW_PORTAL=()
+    while IFS=$'\t' read -r name status; do
+        [[ -z "$name" ]] && continue
+        VMW_PORTAL["$name"]="$status"
+    done < <(printf '%s\n' "$out" | python3 -c '
+import sys
+for block in sys.stdin.read().split("\n\n"):
+    vmknic = status = None
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key, val = key.strip(), val.strip()
+        if key == "Vmknic":
+            vmknic = val
+        elif key == "CompliantStatus":
+            status = val
+    if vmknic:
+        print("%s\t%s" % (vmknic, status or ""))
+')
+}
+
+vmware_vswitch_uplinks() {
+    local ipath="$1" want="$2" out
+    if ! out=$(vmware_esxcli read "$ipath" network vswitch standard list 2>&1); then
+        log_error "  vswitch list failed for ${ipath}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    local found
+    found=$(printf '%s\n' "$out" | awk -v want="$want" '
+        /^Name:/ { name=$2 }
+        /^Uplinks:/ && name==want {
+            sub(/^Uplinks:[[:space:]]*/, "")
+            print
+            hit=1
+        }
+        END { exit hit ? 0 : 1 }
+    ') || {
+        log_error "  vSwitch ${want} not found on ${ipath}"
+        return 1
+    }
+    printf '%s\n' "$found"
+}
+
+# Echo "vswitch uplinkA uplinkB". $3 is a VMWARE_HOST_MAP value, or empty.
+vmware_parse_anchor() {
+    local anchor="$1" csv="$2" mapval="$3"
+    local -a ups=()
+    local part f1 f2 f3
+    if [[ -z "$mapval" ]]; then
+        IFS=',' read -r -a ups <<< "$csv"
+        local clean=()
+        for part in "${ups[@]}"; do
+            part="${part#"${part%%[![:space:]]*}"}"
+            part="${part%"${part##*[![:space:]]}"}"
+            [[ -n "$part" ]] && clean+=("$part")
+        done
+        if [[ ${#clean[@]} -ne 2 ]]; then
+            log_error "  ${anchor} has ${#clean[@]} uplinks (${csv}); set VMWARE_HOST_MAP"
+            return 1
+        fi
+        echo "${anchor} ${clean[0]} ${clean[1]}"
+        return 0
+    fi
+    IFS=':' read -r f1 f2 f3 <<< "$mapval"
+    if [[ -n "$f3" ]]; then
+        echo "${f1} ${f2} ${f3}"
+        return 0
+    fi
+    if [[ "$f1" == vmnic* && "$f2" == vmnic* ]]; then
+        echo "${anchor} ${f1} ${f2}"
+        return 0
+    fi
+    log_error "  VMWARE_HOST_MAP value '${mapval}' must be uplinkA:uplinkB or vSwitch:uplinkA:uplinkB"
+    return 1
+}
+
+vmware_uplink_in_csv() {
+    local csv="$1" want="$2" part
+    local -a ups=()
+    IFS=',' read -r -a ups <<< "$csv"
+    for part in "${ups[@]}"; do
+        part="${part#"${part%%[![:space:]]*}"}"
+        part="${part%"${part##*[![:space:]]}"}"
+        [[ "$part" == "$want" ]] && return 0
+    done
+    return 1
+}
+
+vmware_one_active_uplink() {
+    local ipath="$1" pg="$2" out active
+    if ! out=$(vmware_esxcli read "$ipath" network vswitch standard portgroup policy failover get -p "$pg" 2>&1); then
+        log_error "  failover get failed for ${pg}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    active=$(printf '%s\n' "$out" | awk -F: '/^ActiveAdapters:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    local -a parts=()
+    local n=0 one="" part
+    IFS=', ' read -r -a parts <<< "$active"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        n=$((n + 1))
+        one="$part"
+    done
+    if [[ "$n" -ne 1 ]]; then
+        return 2
+    fi
+    printf '%s\n' "$one"
+    return 0
+}
+
+vmware_map_value() {
+    local short="$1" pair key
+    for pair in ${VMWARE_HOST_MAP}; do
+        key="${pair%%=*}"
+        if [[ "$key" == "$short" ]]; then
+            echo "${pair#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+vmware_resolve_placement() {
+    local ipath="$1" short="$2"
+    local vm_vs="${VMW_PG_VS[$VMWARE_VM_PORTGROUP]:-}"
+    local ibm_vs="${VMW_PG_VS[ibm]:-}"
+    local ibm2_vs="${VMW_PG_VS[ibm2]:-}"
+
+    if [[ -n "$ibm_vs" && -n "$ibm2_vs" ]]; then
+        local up_a="" up_b="" rc_a=0 rc_b=0
+        if ! up_a=$(vmware_one_active_uplink "$ipath" ibm); then
+            rc_a=$?
+        fi
+        if ! up_b=$(vmware_one_active_uplink "$ipath" ibm2); then
+            rc_b=$?
+        fi
+        if [[ "$rc_a" -eq 1 || "$rc_b" -eq 1 ]]; then
+            return 1
+        fi
+        if [[ "$rc_a" -ne 0 || "$rc_b" -ne 0 ]]; then
+            log_error "  ibm/ibm2 do not each have one active uplink; not using ${VMWARE_ANCHOR_VSWITCH}"
+            return 1
+        fi
+        if [[ "$ibm_vs" == "$vm_vs" || "$ibm2_vs" == "$vm_vs" ]]; then
+            log_error "  rejected vSwitch ${vm_vs}: it owns ${VMWARE_VM_PORTGROUP}"
+            return 1
+        fi
+        VMW_SRC="portgroup"
+        VMW_VS_A="$ibm_vs"
+        VMW_UP_A="$up_a"
+        VMW_VS_B="$ibm2_vs"
+        VMW_UP_B="$up_b"
+        return 0
+    fi
+
+    local mapval="" csv vs upa upb choice
+    mapval=$(vmware_map_value "$short") || mapval=""
+    if ! csv=$(vmware_vswitch_uplinks "$ipath" "$VMWARE_ANCHOR_VSWITCH"); then
+        return 1
+    fi
+    if ! choice=$(vmware_parse_anchor "$VMWARE_ANCHOR_VSWITCH" "$csv" "$mapval"); then
+        return 1
+    fi
+    read -r vs upa upb <<< "$choice"
+    if [[ "$vs" != "$VMWARE_ANCHOR_VSWITCH" ]]; then
+        if ! csv=$(vmware_vswitch_uplinks "$ipath" "$vs"); then
+            return 1
+        fi
+    fi
+    if ! vmware_uplink_in_csv "$csv" "$upa" || ! vmware_uplink_in_csv "$csv" "$upb"; then
+        log_error "  uplinks ${upa} and ${upb} are not both on ${vs} (${csv})"
+        return 1
+    fi
+    if [[ -n "$vm_vs" && "$vs" == "$vm_vs" ]]; then
+        log_error "  rejected vSwitch ${vm_vs}: it owns ${VMWARE_VM_PORTGROUP}"
+        return 1
+    fi
+    VMW_SRC="predefined"
+    VMW_VS_A="$vs"
+    VMW_UP_A="$upa"
+    VMW_VS_B="$vs"
+    VMW_UP_B="$upb"
+}
+
+vmware_change_allowed() {
+    local ipath="$1" ip="$2" out
+    if [[ -z "$ip" || "$ip" == "0.0.0.0" ]]; then
+        return 0
+    fi
+    if ! out=$(vmware_esxcli read "$ipath" iscsi session connection list 2>&1); then
+        log_error "  cannot read iSCSI sessions for ${ip}; not changing the vmkernel"
+        return 1
+    fi
+    if printf '%s\n' "$out" | awk -v ip="$ip" 'BEGIN{RS=""; found=0}
+        {
+            local=""; state=""
+            n=split($0, lines, "\n")
+            for (i=1; i<=n; i++) {
+                if (lines[i] ~ /^LocalAddress:/) { split(lines[i], a, ":"); local=a[2]; gsub(/ /,"",local) }
+                if (lines[i] ~ /^State:/) { split(lines[i], a, ":"); state=a[2]; gsub(/ /,"",state) }
+            }
+            if (local==ip && state=="logged_in") found=1
+        }
+        END{exit found?0:1}'; then
+        log_error "  ${ip} has logged_in sessions; not changing VLAN or DHCP"
+        return 1
+    fi
+    return 0
+}
+
+vmware_ip_in_subnet() {
+    local ip="$1" base="$2"
+    [[ "$ip" == "${base}".* && "$ip" != "${base}.0" && "$ip" != "${base}.255" && "$ip" != "0.0.0.0" ]]
+}
+
+vmware_vmk_for_pg() {
+    local pg="$1" name
+    for name in "${!VMW_VMK_PG[@]}"; do
+        if [[ "${VMW_VMK_PG[$name]}" == "$pg" ]]; then
+            echo "$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+vmware_alloc_vmk() {
+    local i name
+    for i in $(seq 5 32); do
+        name="vmk${i}"
+        [[ -n "${VMW_VMK_PG[$name]:-}" ]] && continue
+        echo "$name"
+        return 0
+    done
+    log_error "  no free vmkernel at or above vmk5"
+    return 1
+}
+
+vmware_strip_tags() {
+    local ipath="$1" vmk="$2" out tag
+    if ! out=$(vmware_esxcli read "$ipath" network ip interface tag get -i "$vmk" 2>&1); then
+        log_error "  tag get failed for ${vmk}"
+        return 1
+    fi
+    for tag in Management VMotion vSphereProvisioning; do
+        if printf '%s\n' "$out" | grep -qw "$tag"; then
+            vmware_esxcli write "$ipath" network ip interface tag remove -i "$vmk" -t "$tag" || return 1
+        fi
+    done
+}
+
+vmware_wait_dhcp() {
+    local ipath="$1" vmk="$2" base="$3" i ip
+    for i in $(seq 1 12); do
+        vmware_load_ips "$ipath" || return 1
+        ip="${VMW_VMK_IP[$vmk]:-}"
+        if vmware_ip_in_subnet "$ip" "$base"; then
+            echo "$ip"
+            return 0
+        fi
+        sleep 5
+    done
+    log_error "  ${vmk} did not get a DHCP address in ${base}.0/24"
+    return 1
+}
+
+vmware_bind_portal() {
+    local ipath="$1" vmk="$2"
+    if [[ -z "${VMW_PORTAL[$vmk]:-}" ]]; then
+        vmware_esxcli write "$ipath" iscsi networkportal add -A "$VMWARE_ISCSI_ADAPTER" -n "$vmk" || return 1
+        if [[ "$DRY_RUN" == "true" ]]; then
+            return 0
+        fi
+        vmware_load_portals "$ipath" || return 1
+    fi
+    if [[ "${VMW_PORTAL[$vmk]:-}" != "compliant" ]]; then
+        log_error "  ${vmk} iSCSI portal is '${VMW_PORTAL[$vmk]:-missing}', expected compliant"
+        return 1
+    fi
+}
+
+vmware_pin_matches() {
+    local ipath="$1" pg="$2" uplink="$3" out active standby
+    if ! out=$(vmware_esxcli read "$ipath" network vswitch standard portgroup policy failover get -p "$pg" 2>&1); then
+        log_error "  failover get failed for ${pg}: $(printf '%s\n' "$out" | vmware_redact)"
+        return 2
+    fi
+    active=$(printf '%s\n' "$out" | awk -F: '/^ActiveAdapters:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    standby=$(printf '%s\n' "$out" | awk -F: '/^StandbyAdapters:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    if [[ "$active" == "$uplink" && -z "$standby" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+vmware_ensure_path() {
+    local ipath="$1" vendor="$2" path="$3" vswitch="$4" uplink="$5"
+    local pg digit d vlan base vmk ip mtu
+    pg=$(vmware_pg_name "$vendor" "$path") || return 1
+    digit=$(get_platform_digit_a "$vendor") || return 1
+    d="$digit"
+    [[ "$path" == "B" ]] && d=$((digit + 1))
+    vlan=$(calc_vlan "$d")
+    base=$(calc_subnet_base "$d")
+
+    local cur_vs="${VMW_PG_VS[$pg]:-}"
+    if [[ -z "$cur_vs" ]]; then
+        log "  ${pg}: vlan ${vlan} ${vswitch} uplink ${uplink} dhcp ${base}.0/24 create"
+        vmware_esxcli write "$ipath" network vswitch standard portgroup add -p "$pg" -v "$vswitch" || return 1
+        vmware_esxcli write "$ipath" network vswitch standard portgroup set -p "$pg" -v "$vlan" || return 1
+        vmware_esxcli write "$ipath" network vswitch standard portgroup policy failover set \
+            -portgroup-name="$pg" -active-uplinks="$uplink" -standby-uplinks= || return 1
+        VMW_PG_VS["$pg"]="$vswitch"
+        VMW_PG_VLAN["$pg"]="$vlan"
+    elif [[ "$cur_vs" != "$vswitch" ]]; then
+        log_error "  ${pg} is on ${cur_vs}, not ${vswitch}"
+        return 1
+    else
+        if [[ "${VMW_PG_VLAN[$pg]}" != "$vlan" ]]; then
+            vmk=$(vmware_vmk_for_pg "$pg" || true)
+            ip=""
+            if [[ -n "$vmk" ]]; then
+                ip="${VMW_VMK_IP[$vmk]:-}"
+            fi
+            vmware_change_allowed "$ipath" "$ip" || return 1
+            log "  ${pg}: set vlan ${vlan}"
+            vmware_esxcli write "$ipath" network vswitch standard portgroup set -p "$pg" -v "$vlan" || return 1
+            VMW_PG_VLAN["$pg"]="$vlan"
+        fi
+        if vmware_pin_matches "$ipath" "$pg" "$uplink"; then
+            :
+        else
+            local pin_rc=$?
+            if [[ "$pin_rc" -ne 1 ]]; then
+                return 1
+            fi
+            log "  ${pg}: pin active ${uplink}"
+            vmware_esxcli write "$ipath" network vswitch standard portgroup policy failover set \
+                -portgroup-name="$pg" -active-uplinks="$uplink" -standby-uplinks= || return 1
+        fi
+    fi
+
+    if ! vmk=$(vmware_vmk_for_pg "$pg"); then
+        vmk=$(vmware_alloc_vmk) || return 1
+        log "  ${pg}: add ${vmk} mtu 9000 dhcp ${base}.0/24"
+        vmware_esxcli write "$ipath" network ip interface add -i "$vmk" -p "$pg" || return 1
+        vmware_esxcli write "$ipath" network ip interface set -i "$vmk" -m 9000 || return 1
+        VMW_VMK_PG["$vmk"]="$pg"
+        VMW_VMK_MTU["$vmk"]="9000"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would set DHCP on ${vmk}, bind it to ${VMWARE_ISCSI_ADAPTER}, and require ${base}.0/24"
+            return 0
+        fi
+        vmware_strip_tags "$ipath" "$vmk" || return 1
+        vmware_esxcli write "$ipath" network ip interface ipv4 set -i "$vmk" -t dhcp || return 1
+        ip=$(vmware_wait_dhcp "$ipath" "$vmk" "$base") || return 1
+        VMW_VMK_IP["$vmk"]="$ip"
+        log "  ${pg}: ${vmk} ${ip}"
+        vmware_bind_portal "$ipath" "$vmk" || return 1
+        return 0
+    fi
+
+    mtu="${VMW_VMK_MTU[$vmk]:-}"
+    if [[ "$mtu" != "9000" ]]; then
+        vmware_esxcli write "$ipath" network ip interface set -i "$vmk" -m 9000 || return 1
+        VMW_VMK_MTU["$vmk"]="9000"
+    fi
+    vmware_strip_tags "$ipath" "$vmk" || return 1
+    ip="${VMW_VMK_IP[$vmk]:-}"
+    if ! vmware_ip_in_subnet "$ip" "$base"; then
+        vmware_change_allowed "$ipath" "$ip" || return 1
+        log "  ${pg}: ${vmk} DHCP for ${base}.0/24"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY-RUN] Would set DHCP on ${vmk} and require ${base}.0/24"
+        else
+            vmware_esxcli write "$ipath" network ip interface ipv4 set -i "$vmk" -t dhcp || return 1
+            ip=$(vmware_wait_dhcp "$ipath" "$vmk" "$base") || return 1
+            VMW_VMK_IP["$vmk"]="$ip"
+            log "  ${pg}: ${vmk} ${ip}"
+        fi
+    fi
+    vmware_bind_portal "$ipath" "$vmk" || return 1
+    if [[ "${VMW_PG_VLAN[$pg]}" == "$vlan" ]] && vmware_ip_in_subnet "${VMW_VMK_IP[$vmk]:-}" "$base"; then
+        log "  ${pg}: vlan ${vlan} ${vswitch} uplink ${uplink} ${vmk} ${VMW_VMK_IP[$vmk]} already matches"
+    fi
+}
+
+vmware_default_on_vmk0() {
+    local ipath="$1" out iface
+    if ! out=$(vmware_esxcli read "$ipath" network ip route ipv4 list 2>&1); then
+        log_error "  route list failed: $(printf '%s\n' "$out" | vmware_redact)"
+        return 1
+    fi
+    iface=$(printf '%s\n' "$out" | awk '$1=="default" {print $4; found=1} END{exit found?0:1}') || {
+        log_error "  no default route found"
+        return 1
+    }
+    if [[ "$iface" != "vmk0" ]]; then
+        log_error "  default route is on ${iface}, expected vmk0"
+        return 1
+    fi
+    log "  default route on vmk0"
+}
+
+vmware_setup_host() {
+    local ipath="$1"
+    local short vendor
+    short=$(vmware_short_name "$ipath")
+    log ""
+    log "=== Processing: ${short} (${ipath}) ==="
+    vmware_reset_caches
+    vmware_load_portgroups "$ipath" || return 1
+    vmware_resolve_placement "$ipath" "$short" || return 1
+    log "  placement source=${VMW_SRC} pathA=${VMW_VS_A}:${VMW_UP_A} pathB=${VMW_VS_B}:${VMW_UP_B}"
+    vmware_load_vmks "$ipath" || return 1
+    vmware_load_portals "$ipath" || return 1
+
+    local -a vendors_arr=()
+    read -r -a vendors_arr <<< "$STORAGE_ARRAYS"
+    for vendor in "${vendors_arr[@]}"; do
+        vmware_ensure_path "$ipath" "$vendor" A "$VMW_VS_A" "$VMW_UP_A" || return 1
+        vmware_ensure_path "$ipath" "$vendor" B "$VMW_VS_B" "$VMW_UP_B" || return 1
+    done
+    vmware_default_on_vmk0 "$ipath" || return 1
+}
+
+do_host_setup_vmware() {
+    vmware_preflight || return 1
+
+    local -a vendors_arr=()
+    read -r -a vendors_arr <<< "$STORAGE_ARRAYS"
+    local vendor
+    for vendor in "${vendors_arr[@]}"; do
+        vmware_pg_name "$vendor" A >/dev/null || return 1
+    done
+
+    local hosts
+    if ! hosts=$(vmware_list_hosts); then
+        return 1
+    fi
+
+    local -a selected=()
+    local ipath skip excl
+    while IFS= read -r ipath; do
+        [[ -z "$ipath" ]] && continue
+        skip=false
+        if [[ -n "$EXCLUDE_HOSTS" ]]; then
+            for excl in $EXCLUDE_HOSTS; do
+                if [[ "$ipath" == *"$excl"* ]]; then
+                    skip=true
+                fi
+            done
+        fi
+        if [[ "$skip" == "true" ]]; then
+            log "Skipping excluded host: ${ipath}"
+            continue
+        fi
+        if [[ -n "$SINGLE_WORKER" && "$ipath" != *"$SINGLE_WORKER"* ]]; then
+            continue
+        fi
+        selected+=("$ipath")
+    done <<< "$hosts"
+
+    if (( ${#selected[@]} == 0 )); then
+        if [[ -n "$SINGLE_WORKER" ]]; then
+            log_error "No ESXi hosts under ${VMWARE_HOST_FOLDER} match '${SINGLE_WORKER}'"
+        else
+            log_error "No ESXi hosts selected under ${VMWARE_HOST_FOLDER}"
+        fi
+        return 1
+    fi
+
+    log "ESXi hosts from ${VMWARE_HOST_FOLDER}: ${#selected[@]}"
+    log "VLAN layout plan (ESXi portgroups, no NIC flip):"
+    for vendor in "${vendors_arr[@]}"; do
+        local digit d vlan sub pg path
+        digit=$(get_platform_digit_a "$vendor") || return 1
+        for path in A B; do
+            d="$digit"
+            [[ "$path" == "B" ]] && d=$((digit + 1))
+            vlan=$(calc_vlan "$d")
+            sub=$(calc_subnet_base "$d")
+            pg=$(vmware_pg_name "$vendor" "$path") || return 1
+            log "  ${pg}: vlan${vlan} DHCP ${sub}.0/24 path ${path}"
+        done
+    done
+
+    local failed=0
+    for ipath in "${selected[@]}"; do
+        if ! vmware_setup_host "$ipath"; then
+            failed=1
+        fi
+    done
+
+    if [[ "$failed" -ne 0 ]]; then
+        log_error "One or more ESXi hosts were skipped or failed"
+        return 1
+    fi
+}
+
 # ---- Main host-setup dispatcher ----------------------------------------------
 do_host_setup() {
     log "=== STAGE: host-setup ==="
@@ -1069,6 +1748,10 @@ do_host_setup() {
     fi
 
     log "Target type: ${TARGET_TYPE}"
+    if [[ "$TARGET_TYPE" == "vmware" ]]; then
+        do_host_setup_vmware || return 1
+        return 0
+    fi
     log "VLAN layout plan (alternating NIC-to-path mapping):"
     compute_vlan_layout | while read -r bios_nic vlan_id subnet_base vendor path; do
         local vendor_name="${PLATFORM_NAMES[$vendor]:-$vendor}"
@@ -1126,10 +1809,10 @@ do_host_setup() {
             done
         fi
 
-    # ---- Bare-metal / VMware path: SSH + nmcli ----
+    # ---- Bare-metal path: SSH + nmcli ----
     else
         log ""
-        log "--- Bare-metal/VMware mode: SSH + nmcli ---"
+        log "--- Bare-metal mode: SSH + nmcli ---"
         parse_hosts "$json" | while read -r hostname model; do
             if [[ -n "$EXCLUDE_HOSTS" ]]; then
                 local skip=false
