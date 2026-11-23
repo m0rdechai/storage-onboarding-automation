@@ -536,7 +536,7 @@ HEADER
         local prev_host=""
         tail -n +2 "$csv_file" | sort | while IFS=',' read -r hostname iface mac; do
             local nic_num="${iface#em}"
-            echo "quads --mod-switch-conf --host ${hostname} --nic${nic_num} ${CLOUD99_OUTER_VLAN} --change # reassign vlan membership from ${cloud_name} for ${mac} to cloud99"
+            echo "quads --modify-switch-conf --host ${hostname} --nic${nic_num} ${CLOUD99_OUTER_VLAN} --change # reassign vlan membership from ${cloud_name} for ${mac} to cloud99"
         done
 
         echo ""
@@ -1475,12 +1475,8 @@ vmware_resolve_placement() {
 
     if [[ -n "$ibm_vs" && -n "$ibm2_vs" ]]; then
         local up_a="" up_b="" rc_a=0 rc_b=0
-        if ! up_a=$(vmware_one_active_uplink "$ipath" ibm); then
-            rc_a=$?
-        fi
-        if ! up_b=$(vmware_one_active_uplink "$ipath" ibm2); then
-            rc_b=$?
-        fi
+        up_a=$(vmware_one_active_uplink "$ipath" ibm) || rc_a=$?
+        up_b=$(vmware_one_active_uplink "$ipath" ibm2) || rc_b=$?
         if [[ "$rc_a" -eq 1 || "$rc_b" -eq 1 ]]; then
             return 1
         fi
@@ -1576,6 +1572,7 @@ vmware_alloc_vmk() {
     for i in $(seq 5 32); do
         name="vmk${i}"
         [[ -n "${VMW_VMK_PG[$name]:-}" ]] && continue
+        [[ -n "${VMW_PORTAL[$name]:-}" ]] && continue
         echo "$name"
         return 0
     done
@@ -2195,16 +2192,85 @@ storage_target_ostype() {
 }
 
 # Log the ostype already stored on a NetApp object. Does not change it.
+# A value that differs from storage_target_ostype is a warning.
 netapp_log_ostype() {
     local vendor="$1"
     local label="$2"
     shift 2
-    local out stored
+    local out stored expected
     out=$(storage_ssh "$vendor" "$*" 2>/dev/null || true)
-    stored=$(printf '%s\n' "$out" | awk 'NF && $NF != "ostype" && $1 != "vserver" && $1 !~ /^-/ { print $NF; exit }')
-    if [[ -n "$stored" ]]; then
-        log "  ${label} ostype is ${stored}"
+    stored=$(printf '%s\n' "$out" | tr -d '\r' | awk '
+        $1 == "vserver" {
+            col = 0
+            for (i = 1; i <= NF; i++) if ($i == "ostype") col = i
+            next
+        }
+        col && $1 !~ /^-/ && NF >= col { print $col; exit }
+    ')
+    stored=${stored//[[:space:]]/}
+    expected=$(storage_target_ostype)
+    if [[ -z "$stored" ]]; then
+        if [[ "$DRY_RUN" != "true" ]]; then
+            log_warn "  ${label}: could not read ostype; leaving it unchanged"
+        fi
+        return 0
     fi
+    if [[ "$stored" != "$expected" ]]; then
+        log_warn "  ${label} ostype is ${stored}; expected ${expected}; leaving it unchanged"
+        return 0
+    fi
+    log "  ${label} ostype is ${stored}"
+}
+
+# 0 when a show row names this LIF. Header and error text do not count.
+netapp_lif_named() {
+    local lif="$1"
+    tr -d '\r' | awk -v lif="$lif" '
+        $0 ~ /^Error:/ { next }
+        $1 == "vserver" || $1 ~ /^-/ { next }
+        {
+            for (i = 1; i <= NF; i++) if ($i == lif) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+# Create one NetApp LIF when that name is absent. An existing name is skipped.
+# A create that fails because the name appeared anyway is also skipped.
+netapp_ensure_lif() {
+    local vendor="$1" svm="$2" lif="$3" create_cmd="$4"
+    local show="" show_status=0
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would create LIF ${lif}: ${create_cmd}"
+        return 0
+    fi
+
+    show=$(storage_ssh "$vendor" "network interface show -vserver ${svm} -lif ${lif} -fields lif" 2>/dev/null) || show_status=$?
+    if [[ "$show_status" -eq 0 ]] && netapp_lif_named "$lif" <<< "$show"; then
+        log_success "  LIF ${lif} already exists"
+        return 0
+    fi
+
+    local out="" status=0
+    out=$(storage_ssh "$vendor" "$create_cmd" 2>&1) || status=$?
+    if [[ "$status" -eq 0 ]]; then
+        log_success "  LIF ${lif} created"
+        return 0
+    fi
+
+    show_status=0
+    show=$(storage_ssh "$vendor" "network interface show -vserver ${svm} -lif ${lif} -fields lif" 2>/dev/null) || show_status=$?
+    if [[ "$show_status" -eq 0 ]] && netapp_lif_named "$lif" <<< "$show"; then
+        log_success "  LIF ${lif} already exists"
+        return 0
+    fi
+    log_error "  Failed to create LIF ${lif}"
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log "    ${line}"
+    done <<< "$out"
+    return 1
 }
 
 # =============================================================================
@@ -2357,15 +2423,15 @@ storage_setup_netapp_asa() {
             done || true
         else
             log "  Creating LIFs (found ${lif_count}/4)..."
-            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node1}_a" \
+            netapp_ensure_lif netapp-asa "$svm" "iscsi_${cloud_name}_${node1}_a" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node2}_a" \
+            netapp_ensure_lif netapp-asa "$svm" "iscsi_${cloud_name}_${node2}_a" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node1}_b" \
+            netapp_ensure_lif netapp-asa "$svm" "iscsi_${cloud_name}_${node1}_b" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-asa "Failed to create LIF iscsi_${cloud_name}_${node2}_b" \
+            netapp_ensure_lif netapp-asa "$svm" "iscsi_${cloud_name}_${node2}_b" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" || return 1
-            log_success "  LIF creation commands issued"
+            log_success "  LIF check complete"
         fi
     fi
 
@@ -2676,7 +2742,8 @@ storage_setup_pure() {
             local owner=""
             owner=$(storage_ssh pure "purehost list" 2>&1 | awk -v iqn="$iqn" 'index($0, iqn) { print $1; exit }' || true)
             if [[ -n "$owner" && "$owner" != "$host_name" ]]; then
-                log "  IQN ${iqn} is already on Pure host ${owner}; leaving that host unchanged"
+                log_warn "  IQN ${iqn} is already on Pure host ${owner}; leaving that host unchanged"
+                pure_failed=1
                 continue
             fi
         fi
@@ -3023,10 +3090,19 @@ ibm_bind_one_host() {
             fi
         fi
         if [[ -n "$cluster" ]]; then
-            local free
-            free=$(ibm_lowest_free_scsi "$occupied") || free="none"
-            log "  ${host_name} is a member of host cluster ${cluster}; leaving vdisk maps unchanged"
-            log "  Lowest free SCSI id on ${host_name} is ${free}; not used"
+            local missing=0 i vdisk
+            for (( i=1; i<=LUN_COUNT; i++ )); do
+                vdisk=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
+                if [[ -n "$rows" ]] && printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { found=1 } END { exit found ? 0 : 1 }'; then
+                    log_success "  vdisk ${vdisk} already mapped to ${host_name} through host cluster ${cluster}"
+                else
+                    log_warn "  ${host_name} is a member of host cluster ${cluster}; ${vdisk} is not mapped; leaving vdisk maps unchanged"
+                    missing=1
+                fi
+            done
+            if [[ "$missing" -ne 0 ]]; then
+                return 1
+            fi
             return 0
         fi
     fi
@@ -3441,15 +3517,15 @@ storage_setup_netapp_aff() {
             done || true
         else
             log "  Creating LIFs (found ${lif_count}/4)..."
-            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node1}_a" \
+            netapp_ensure_lif netapp-aff "$svm" "iscsi_${cloud_name}_${node1}_a" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node2}_a" \
+            netapp_ensure_lif netapp-aff "$svm" "iscsi_${cloud_name}_${node2}_a" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node1}_b" \
+            netapp_ensure_lif netapp-aff "$svm" "iscsi_${cloud_name}_${node1}_b" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" || return 1
-            storage_apply netapp-aff "Failed to create LIF iscsi_${cloud_name}_${node2}_b" \
+            netapp_ensure_lif netapp-aff "$svm" "iscsi_${cloud_name}_${node2}_b" \
                 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" || return 1
-            log_success "  LIF creation commands issued"
+            log_success "  LIF check complete"
         fi
     fi
 
@@ -4023,8 +4099,10 @@ do_check() {
         return 1
     fi
 
-    local json
-    json=$(quads_query_hosts) || return 1
+    local json=""
+    if [[ "$TARGET_TYPE" != "vmware" ]]; then
+        json=$(quads_query_hosts) || return 1
+    fi
 
     # Build list of portal IPs to check (first portal IP per path: .2)
     local -a portal_ips=()
@@ -4036,8 +4114,7 @@ do_check() {
 
     log "Portal IPs to check: ${portal_ips[*]}"
 
-    # For OCP, iterate over actual OCP worker node names
-    # For bare-metal, iterate over QUADS hosts
+    # OCP uses worker node names. VMware pings through govc. Bare metal uses QUADS hosts.
     if [[ "$TARGET_TYPE" == "ocp" ]]; then
         local -a check_nodes=()
         if command -v oc &>/dev/null; then
@@ -4091,6 +4168,32 @@ for h in data:
                 done
             fi
         done
+    elif [[ "$TARGET_TYPE" == "vmware" ]]; then
+        vmware_preflight || return 1
+        local hosts_out="" sel_status=0
+        hosts_out=$(vmware_selected_hosts) || sel_status=$?
+        if [[ "$sel_status" -ne 0 || -z "$hosts_out" ]]; then
+            return 1
+        fi
+        local ipath portal_ip ping_out ping_rc
+        while IFS= read -r ipath; do
+            [[ -z "$ipath" ]] && continue
+            log "  Checking ${ipath}..."
+            for portal_ip in "${portal_ips[@]}"; do
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    log "    [DRY-RUN] Would ping ${portal_ip} from ${ipath}"
+                    continue
+                fi
+                ping_rc=0
+                ping_out=$(timeout 30 govc host.esxcli -host.ipath "$ipath" network diag ping -c 2 -W 3 -H "$portal_ip" 2>&1) || ping_rc=$?
+                if [[ "$ping_rc" -eq 0 ]] && printf '%s\n' "$ping_out" | grep -Eq 'Re(ce|cie)ived:[[:space:]]*[1-9]'; then
+                    log_success "    ${portal_ip}: reachable"
+                else
+                    log_warn "    ${portal_ip}: ping failed ($(printf '%s\n' "$ping_out" | vmware_redact | tr '\n' ' '))"
+                fi
+            done
+        done <<< "$hosts_out"
+        return 0
     else
         parse_hosts "$json" | while read -r hostname model; do
             if [[ -n "$EXCLUDE_HOSTS" ]]; then
