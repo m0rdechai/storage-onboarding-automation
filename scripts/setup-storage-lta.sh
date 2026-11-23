@@ -49,6 +49,15 @@ VMWARE_HOST_MAP=""
 VMWARE_ANCHOR_VSWITCH="vSwitch2"
 VMWARE_VM_PORTGROUP="VM Network"
 VMWARE_ISCSI_ADAPTER="vmhba64"
+# storage-setup iSCSI govc bounds. host-setup does not use these.
+VMWARE_ADAPTER_GET_TIMEOUT=60
+VMWARE_SENDTARGET_LIST_TIMEOUT=60
+VMWARE_SENDTARGET_ADD_TIMEOUT=120
+VMWARE_SESSION_LIST_TIMEOUT=60
+VMWARE_REDISCOVER_TIMEOUT=900
+VMWARE_ADAPTER_POLL_INTERVAL=30
+VMWARE_ADAPTER_POLL_WINDOW=300
+VMWARE_JOB_PARALLEL=4
 
 # Volume / LUN configuration for storage-setup stage
 LUN_SIZE="1TB"
@@ -1204,11 +1213,38 @@ vmware_esxcli_bounded() {
     timeout "$seconds" govc host.esxcli -host.ipath "$ipath" "$@"
 }
 
+# A read through govc. Dry-run still runs it. Exit 124 means the client
+# was killed after `seconds`.
+vmware_iscsi_timeout() {
+    local seconds="$1" ipath="$2"
+    shift 2
+    log_verbose "govc host.esxcli -host.ipath ${ipath} $*"
+    timeout "$seconds" govc host.esxcli -host.ipath "$ipath" "$@"
+}
+
+# Wait for background jobs started in this shell. Sets VMW_WAIT_FAILED
+# to the number of non-zero exits. Must not be called from $().
+vmware_wait_pids() {
+    local pid rc
+    VMW_WAIT_FAILED=0
+    for pid in "$@"; do
+        rc=0
+        wait "$pid" || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            VMW_WAIT_FAILED=$((VMW_WAIT_FAILED + 1))
+        fi
+    done
+}
+
 # Name: value from `iscsi adapter get` that starts with iqn.
 vmware_adapter_iqn() {
     local ipath="$1"
     local out status=0 name
-    out=$(vmware_esxcli read "$ipath" iscsi adapter get -A "$VMWARE_ISCSI_ADAPTER" 2>&1) || status=$?
+    out=$(vmware_iscsi_timeout "$VMWARE_ADAPTER_GET_TIMEOUT" "$ipath" iscsi adapter get -A "$VMWARE_ISCSI_ADAPTER" 2>&1) || status=$?
+    if [[ "$status" -eq 124 ]]; then
+        log_error "  ${ipath}: iscsi adapter get did not return within ${VMWARE_ADAPTER_GET_TIMEOUT}s"
+        return 1
+    fi
     if [[ "$status" -ne 0 ]]; then
         log_error "  ${ipath}: iscsi adapter get failed: $(printf '%s\n' "$out" | vmware_redact)"
         return 1
@@ -2002,6 +2038,7 @@ storage_apply() {
 # =============================================================================
 collect_worker_iqns() {
     local -a iqns=()
+    local vmware_iqn_skipped=0
 
     if [[ "$TARGET_TYPE" == "ocp" ]]; then
         local -a ocp_workers=()
@@ -2030,20 +2067,36 @@ collect_worker_iqns() {
         if [[ "$sel_status" -ne 0 || -z "$hosts_out" ]]; then
             return 1
         fi
-        local -a pending=()
-        local ipath short name item
+        local work idx=0 ipath line f
+        local -a pids=()
+        work=$(mktemp -d)
         while IFS= read -r ipath; do
             [[ -z "$ipath" ]] && continue
-            name=$(vmware_adapter_iqn "$ipath") || return 1
-            short=$(vmware_short_name "$ipath")
-            pending+=("${short}:${name}")
+            idx=$((idx + 1))
+            (
+                name=$(vmware_adapter_iqn "$ipath") || exit 1
+                short=$(vmware_short_name "$ipath")
+                printf '%s\n' "${short}:${name}" > "${work}/$(printf '%04d' "$idx").ok"
+            ) &
+            pids+=("$!")
+            if (( ${#pids[@]} >= VMWARE_JOB_PARALLEL )); then
+                vmware_wait_pids "${pids[@]}"
+                vmware_iqn_skipped=$((vmware_iqn_skipped + VMW_WAIT_FAILED))
+                pids=()
+            fi
         done <<< "$hosts_out"
-        if (( ${#pending[@]} > 0 )); then
-            for item in "${pending[@]}"; do
-                iqns+=("$item")
-                log "  ${item%%:*}: ${item#*:}"
-            done
+        if (( ${#pids[@]} > 0 )); then
+            vmware_wait_pids "${pids[@]}"
+            vmware_iqn_skipped=$((vmware_iqn_skipped + VMW_WAIT_FAILED))
         fi
+        for f in "$work"/*.ok; do
+            [[ -e "$f" ]] || continue
+            line=$(cat "$f")
+            [[ -n "$line" ]] || continue
+            iqns+=("$line")
+            log "  ${line%%:*}: ${line#*:}"
+        done
+        rm -rf "$work"
     else
         local json
         json=$(quads_query_hosts) || return 1
@@ -2073,6 +2126,12 @@ collect_worker_iqns() {
     if (( ${#iqns[@]} > 0 )); then
         printf '%s\n' "${iqns[@]}"
     fi
+    if [[ "$TARGET_TYPE" == "vmware" && "$vmware_iqn_skipped" -gt 0 ]]; then
+        if (( ${#iqns[@]} > 0 )); then
+            return 2
+        fi
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -2088,6 +2147,29 @@ parse_lun_size_ibm() {
         gb) echo "${num} gb" ;;
         *)  echo "${num} gb" ;;
     esac
+}
+
+# Meibytes for a size such as 1TB or 100.00GB. 1TB and 1.00TB are equal.
+# Returns 1 when the string is not a number plus a TB, GB, or MB unit.
+ibm_size_mib() {
+    local raw="$1" mib
+    mib=$(printf '%s\n' "$raw" | tr -d '[:space:]' | awk '
+        {
+            s = $0
+            if (match(s, /[A-Za-z]+$/) == 0) exit 1
+            unit = tolower(substr(s, RSTART, RLENGTH))
+            num = substr(s, 1, RSTART - 1)
+            if (num !~ /^[0-9]+(\.[0-9]+)?$/) exit 1
+            factor = 0
+            if (unit == "tb" || unit == "t") factor = 1024 * 1024
+            else if (unit == "gb" || unit == "g") factor = 1024
+            else if (unit == "mb" || unit == "m") factor = 1
+            else exit 1
+            printf "%.0f\n", num * factor
+        }
+    ') || return 1
+    [[ -n "$mib" ]] || return 1
+    printf '%s\n' "$mib"
 }
 
 parse_lun_size_pure() {
@@ -3151,10 +3233,23 @@ storage_setup_ibm() {
     for (( i=1; i<=LUN_COUNT; i++ )); do
         local vdisk_name
         vdisk_name=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
-        local vd_check
-        vd_check=$(storage_ssh ibm "svcinfo lsvdisk ${vdisk_name}" 2>/dev/null | grep -c "${vdisk_name}" || true)
+        local vd_out="" vd_check cap have want
+        vd_out=$(storage_ssh ibm "svcinfo lsvdisk ${vdisk_name}" 2>/dev/null || true)
+        vd_check=$(printf '%s\n' "$vd_out" | grep -c "${vdisk_name}" || true)
         if [[ "$vd_check" -gt 0 ]]; then
             log_success "  vdisk ${vdisk_name} already exists"
+            cap=$(printf '%s\n' "$vd_out" | awk '$1 == "capacity" { print $2; exit }')
+            if [[ -z "$cap" ]]; then
+                log_warn "  vdisk ${vdisk_name}: could not read capacity; leaving the existing vdisk unchanged"
+            else
+                want=$(ibm_size_mib "$LUN_SIZE" || true)
+                have=$(ibm_size_mib "$cap" || true)
+                if [[ -z "$want" || -z "$have" ]]; then
+                    log_warn "  vdisk ${vdisk_name}: could not compare capacity ${cap} with LUN_SIZE ${LUN_SIZE}; leaving the existing vdisk unchanged"
+                elif [[ "$want" != "$have" ]]; then
+                    log_warn "  vdisk ${vdisk_name} capacity is ${cap}; LUN_SIZE is ${LUN_SIZE}; leaving the existing vdisk unchanged"
+                fi
+            fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create: svctask mkvdisk -mdiskgrp Pool0 -iogrp io_grp0 -size ${ibm_num} -unit ${ibm_unit} -name ${vdisk_name}"
@@ -3505,9 +3600,12 @@ vmware_portals_logged_in() {
 
 # Add missing send targets, rediscover once, then wait for logged_in.
 # Dry-run logs the add and rediscover commands and does not run them.
-# Rediscover is supposed to print "Rediscovery started" and return. If it does
-# not return within 60s, this returns 2 so the caller stops before the next host.
-# A logged_in poll that expires returns 1. The caller keeps checking other hosts.
+# Rediscover holds this host's iSCSI command path until ESXi finishes.
+# The client waits VMWARE_REDISCOVER_TIMEOUT seconds. If that client times
+# out, poll iscsi adapter get and then read the session list once.
+# logged_in on every portal is success. A host whose adapter does not
+# answer is not rediscovered. This function rediscovers a host at most
+# once and returns 1 on failure. The caller keeps going.
 vmware_discover_host() {
     local ipath="$1"
     shift
@@ -3531,10 +3629,25 @@ vmware_discover_host() {
         return 0
     fi
 
+    local ag_out="" ag_status=0
+    ag_out=$(vmware_iscsi_timeout "$VMWARE_ADAPTER_GET_TIMEOUT" "$ipath" iscsi adapter get -A "$adapter" 2>&1) || ag_status=$?
+    if [[ "$ag_status" -ne 0 ]]; then
+        if [[ "$ag_status" -eq 124 ]]; then
+            log_error "  ${ipath}: iscsi adapter get did not return within ${VMWARE_ADAPTER_GET_TIMEOUT}s; not running rediscover"
+        else
+            log_error "  ${ipath}: iscsi adapter get failed; not running rediscover: $(printf '%s\n' "$ag_out" | vmware_redact)"
+        fi
+        return 1
+    fi
+
     local list_out="" list_status=0
-    list_out=$(vmware_esxcli read "$ipath" iscsi adapter discovery sendtarget list 2>&1) || list_status=$?
+    list_out=$(vmware_iscsi_timeout "$VMWARE_SENDTARGET_LIST_TIMEOUT" "$ipath" iscsi adapter discovery sendtarget list -A "$adapter" 2>&1) || list_status=$?
     if [[ "$list_status" -ne 0 ]]; then
-        log_error "  ${ipath}: sendtarget list failed: $(printf '%s\n' "$list_out" | vmware_redact)"
+        if [[ "$list_status" -eq 124 ]]; then
+            log_error "  ${ipath}: sendtarget list did not return within ${VMWARE_SENDTARGET_LIST_TIMEOUT}s"
+        else
+            log_error "  ${ipath}: sendtarget list failed: $(printf '%s\n' "$list_out" | vmware_redact)"
+        fi
         return 1
     fi
 
@@ -3545,7 +3658,7 @@ vmware_discover_host() {
             continue
         fi
         local add_out="" add_status=0
-        add_out=$(vmware_esxcli write "$ipath" iscsi adapter discovery sendtarget add -A "$adapter" -a "$addr" 2>&1) || add_status=$?
+        add_out=$(vmware_esxcli_bounded "$VMWARE_SENDTARGET_ADD_TIMEOUT" "$ipath" iscsi adapter discovery sendtarget add -A "$adapter" -a "$addr" 2>&1) || add_status=$?
         if [[ "$add_status" -eq 0 ]]; then
             log_success "  ${ipath}: added send target ${addr}"
             continue
@@ -3554,33 +3667,62 @@ vmware_discover_host() {
             log "    ${add_out}"
         fi
         local again
-        again=$(vmware_esxcli read "$ipath" iscsi adapter discovery sendtarget list 2>&1 || true)
+        again=$(vmware_iscsi_timeout "$VMWARE_SENDTARGET_LIST_TIMEOUT" "$ipath" iscsi adapter discovery sendtarget list -A "$adapter" 2>&1 || true)
         if printf '%s\n' "$again" | grep -F -q -- "$addr"; then
             log_success "  ${ipath}: send target ${addr} already listed"
             continue
         fi
-        log_error "  ${ipath}: failed to add send target ${addr}"
+        if [[ "$add_status" -eq 124 ]]; then
+            log_error "  ${ipath}: sendtarget add did not return within ${VMWARE_SENDTARGET_ADD_TIMEOUT}s"
+        else
+            log_error "  ${ipath}: failed to add send target ${addr}"
+        fi
         return 1
     done
 
     local rd_out="" rd_status=0 rd_line
-    rd_out=$(vmware_esxcli_bounded 60 "$ipath" iscsi adapter discovery rediscover -A "$adapter" 2>&1) || rd_status=$?
+    rd_out=$(vmware_esxcli_bounded "$VMWARE_REDISCOVER_TIMEOUT" "$ipath" iscsi adapter discovery rediscover -A "$adapter" 2>&1) || rd_status=$?
     while IFS= read -r rd_line; do
         [[ -n "$rd_line" ]] && log "    ${rd_line}"
     done <<< "$rd_out"
-    if [[ "$rd_status" -ne 0 ]]; then
-        if [[ "$rd_status" -eq 124 ]]; then
-            log_error "  ${ipath}: rediscover did not return within 60s"
-        else
-            log_error "  ${ipath}: rediscover failed"
+    if [[ "$rd_status" -eq 124 ]]; then
+        log_warn "  ${ipath}: rediscover did not return within ${VMWARE_REDISCOVER_TIMEOUT}s; waiting for the iSCSI adapter"
+        local poll_start=$SECONDS ready=0 poll_status sessions="" sess_status
+        while (( SECONDS - poll_start < VMWARE_ADAPTER_POLL_WINDOW )); do
+            poll_status=0
+            vmware_iscsi_timeout "$VMWARE_ADAPTER_GET_TIMEOUT" "$ipath" iscsi adapter get -A "$adapter" >/dev/null 2>&1 || poll_status=$?
+            if [[ "$poll_status" -eq 0 ]]; then
+                ready=1
+                break
+            fi
+            if (( SECONDS - poll_start >= VMWARE_ADAPTER_POLL_WINDOW )); then
+                break
+            fi
+            sleep "$VMWARE_ADAPTER_POLL_INTERVAL"
+        done
+        if [[ "$ready" -ne 1 ]]; then
+            log_error "  ${ipath}: iscsi adapter get did not return after rediscover; not reading sessions"
+            return 1
         fi
-        return 2
+        sess_status=0
+        sessions=$(vmware_iscsi_timeout "$VMWARE_SESSION_LIST_TIMEOUT" "$ipath" iscsi session connection list 2>&1) || sess_status=$?
+        if [[ "$sess_status" -eq 0 ]] && vmware_portals_logged_in "$sessions" "${addrs[@]}"; then
+            log_success "  ${ipath}: logged_in to ${addrs[*]}"
+            return 0
+        fi
+        log_error "  ${ipath}: rediscover client timed out and sessions are not logged_in"
+        return 1
+    fi
+    if [[ "$rd_status" -ne 0 ]]; then
+        log_error "  ${ipath}: rediscover failed"
+        return 1
     fi
 
-    local start=$SECONDS sessions
+    local start=$SECONDS sessions="" sess_status
     while true; do
-        sessions=$(vmware_esxcli read "$ipath" iscsi session connection list 2>&1 || true)
-        if vmware_portals_logged_in "$sessions" "${addrs[@]}"; then
+        sess_status=0
+        sessions=$(vmware_iscsi_timeout "$VMWARE_SESSION_LIST_TIMEOUT" "$ipath" iscsi session connection list 2>&1) || sess_status=$?
+        if [[ "$sess_status" -eq 0 ]] && vmware_portals_logged_in "$sessions" "${addrs[@]}"; then
             log_success "  ${ipath}: logged_in to ${addrs[*]}"
             return 0
         fi
@@ -3604,17 +3746,25 @@ storage_discovery_vmware() {
     local -a selected=()
     mapfile -t selected <<< "$hosts_out"
 
-    local failed=0 ipath rc
+    local failed=0 ipath
+    local -a pids=()
     for ipath in "${selected[@]}"; do
-        rc=0
-        vmware_discover_host "$ipath" "$@" || rc=$?
-        if [[ "$rc" -eq 2 ]]; then
-            return 1
-        fi
-        if [[ "$rc" -ne 0 ]]; then
-            failed=1
+        vmware_discover_host "$ipath" "$@" &
+        pids+=("$!")
+        if (( ${#pids[@]} >= VMWARE_JOB_PARALLEL )); then
+            vmware_wait_pids "${pids[@]}"
+            if [[ "$VMW_WAIT_FAILED" -gt 0 ]]; then
+                failed=1
+            fi
+            pids=()
         fi
     done
+    if (( ${#pids[@]} > 0 )); then
+        vmware_wait_pids "${pids[@]}"
+        if [[ "$VMW_WAIT_FAILED" -gt 0 ]]; then
+            failed=1
+        fi
+    fi
     if [[ "$failed" -ne 0 ]]; then
         return 1
     fi
@@ -3792,13 +3942,16 @@ do_storage_setup() {
     # OCP and bare dry-runs keep the placeholder and do not touch a host.
     log "Collecting iSCSI initiator IQNs from workers..."
     local -a iqn_pairs=()
+    local collect_partial=0
     if [[ "$DRY_RUN" == "true" && "$TARGET_TYPE" != "vmware" ]]; then
         log "[DRY-RUN] Would collect IQNs from workers via oc debug"
         iqn_pairs=("worker-dry-run:iqn.2026-01.com.example:dry-run")
     else
         local iqn_output="" collect_status=0 pair
         iqn_output=$(collect_worker_iqns) || collect_status=$?
-        if [[ "$collect_status" -ne 0 ]]; then
+        if [[ "$collect_status" -eq 2 ]]; then
+            collect_partial=1
+        elif [[ "$collect_status" -ne 0 ]]; then
             log_error "Failed to collect iSCSI initiator IQNs"
             return 1
         fi
@@ -3828,7 +3981,7 @@ do_storage_setup() {
 
     # A failed vendor does not skip the vendors after it. Sub-stage E
     # receives only the vendors that returned 0.
-    local setup_failed=0
+    local setup_failed=$collect_partial
     local -a discover_vendors=()
     local vendor vendor_rc
     for vendor in "${vendors_arr[@]}"; do
