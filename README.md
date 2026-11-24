@@ -54,7 +54,7 @@ For each vendor in `STORAGE_ARRAYS`, the storage-setup stage runs:
 | **A** | Create network resources — iSCSI portal IPs, subnets, VLANs, LIFs |
 | **B** | Create volumes / LUNs |
 | **C** | Create host objects / igroups with worker IQNs |
-| **D** | Map LUNs to hosts |
+| **D** | Map LUNs to hosts. IBM maps each cloud vdisk once to host cluster `${cloud}_iscsi_hc`. |
 | **E** | On OCP, run iSCSI discovery and login from each worker and verify multipath. On VMware, add send targets with `govc` and check for a `logged_in` session. The QUADS `verify` stage does not use `govc` |
 
 Every create operation checks for existing resources first (idempotent). Re-running is safe.

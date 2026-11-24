@@ -2894,9 +2894,12 @@ storage_setup_pure() {
 
 # =============================================================================
 # IBM host adoption
-# A host that already has this IQN is kept, including its vdisk maps.
+# A host that already has this IQN is kept.
 # chhost runs only for a host this stage just created, or for an empty host
-# whose portset is not the cloud portset. A host-cluster member is not mapped.
+# whose portset is not the cloud portset.
+# Cloud vdisks are mapped once to host cluster ${cloud}_iscsi_hc, which is
+# the shared mapping for every host this stage puts in that cluster.
+# A host in a different cluster is not moved and is not privately mapped.
 # =============================================================================
 ibm_lshost_field() {
     local field="$1"
@@ -2932,6 +2935,26 @@ ibm_lshost() {
     fi
     log_error "  lshost ${name} failed: ${msg:-$out}"
     return 1
+}
+
+# empty, cloud, or "foreign <vdisk>". Cloud vdisks are this stage's volumes.
+ibm_rows_kind() {
+    local cloud_name="$1"
+    local rows="$2"
+    local sid vname kind="empty"
+    if [[ -z "$rows" ]]; then
+        printf 'empty\n'
+        return 0
+    fi
+    while read -r sid vname; do
+        [[ -z "$vname" ]] && continue
+        if [[ ! "$vname" =~ ^${cloud_name}_iscsi_lta_ibm_vdisk[0-9]{2}$ ]]; then
+            printf 'foreign %s\n' "$vname"
+            return 0
+        fi
+        kind="cloud"
+    done <<< "$rows"
+    printf '%s\n' "$kind"
 }
 
 # Prints "scsi_id vdisk_name" rows. Empty output means the host has no maps.
@@ -3090,16 +3113,23 @@ ibm_bind_one_host() {
             fi
         fi
         if [[ -n "$cluster" ]]; then
+            local hc_name="${cloud_name}_iscsi_hc"
+            if [[ "$cluster" == "$hc_name" ]]; then
+                log "  ${host_name} is already in host cluster ${hc_name}"
+                printf 'ours %s\n' "$host_name"
+                return 0
+            fi
             local missing=0 i vdisk
             for (( i=1; i<=LUN_COUNT; i++ )); do
                 vdisk=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
                 if [[ -n "$rows" ]] && printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { found=1 } END { exit found ? 0 : 1 }'; then
                     log_success "  vdisk ${vdisk} already mapped to ${host_name} through host cluster ${cluster}"
                 else
-                    log_warn "  ${host_name} is a member of host cluster ${cluster}; ${vdisk} is not mapped; leaving vdisk maps unchanged"
+                    log_warn "  ${host_name} is a member of host cluster ${cluster}; ${vdisk} is not mapped to that cluster. This stage will not change ${cluster}."
                     missing=1
                 fi
             done
+            printf 'foreign %s\n' "$host_name"
             if [[ "$missing" -ne 0 ]]; then
                 return 1
             fi
@@ -3107,33 +3137,270 @@ ibm_bind_one_host() {
         fi
     fi
 
-    local planned="$occupied" i vdisk free
-    for (( i=1; i<=LUN_COUNT; i++ )); do
-        vdisk=$(printf "${cloud_name}_iscsi_lta_ibm_vdisk%02d" "$i")
-        if [[ -n "$rows" ]] && printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { found=1 } END { exit found ? 0 : 1 }'; then
-            log_success "  vdisk ${vdisk} already mapped to ${host_name}"
-            # Keep that SCSI id occupied so the next vdisk takes a different one.
-            sid=$(printf '%s\n' "$rows" | awk -v v="$vdisk" '$2 == v { print $1; exit }')
-            if [[ -n "$sid" && "$planned" != *" ${sid} "* && "$planned" != "${sid}" ]]; then
-                planned+=" ${sid}"
-            fi
+    local kind_line=""
+    kind_line=$(ibm_rows_kind "$cloud_name" "$rows")
+    if [[ "$kind_line" == foreign\ * ]]; then
+        log_error "  ${host_name} has vdisk ${kind_line#foreign }, which is not a ${cloud_name} volume. Not adding ${host_name} to host cluster ${cloud_name}_iscsi_hc."
+        printf 'blocked %s\n' "$host_name"
+        return 1
+    fi
+    if [[ "$kind_line" == "cloud" ]]; then
+        printf 'none cloud %s\n' "$host_name"
+    else
+        printf 'none empty %s\n' "$host_name"
+    fi
+}
+
+# 0 when the cluster exists, 1 when it does not, 2 when the query fails.
+ibm_hostcluster_exists() {
+    local name="$1"
+    local out status=0 line
+    out=$(storage_ssh --read ibm "svcinfo lshostcluster -delim :" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  lshostcluster failed"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log "    ${line}"
+        done <<< "$out"
+        return 2
+    fi
+    if printf '%s\n' "$out" | awk -F: -v n="$name" '$2 == n { found=1 } END { exit found ? 0 : 1 }'; then
+        return 0
+    fi
+    return 1
+}
+
+# Prints the SCSI id when lsvdiskhostmap shows this cluster. Returns 1 when
+# the vdisk is not mapped to the cluster, 2 when the vdisk itself is missing.
+ibm_cluster_map_scsi() {
+    local vdisk="$1"
+    local cluster="$2"
+    local out status=0 scsi
+    out=$(storage_ssh --read ibm "svcinfo lsvdiskhostmap -delim : ${vdisk}" 2>&1) || status=$?
+    scsi=$(printf '%s\n' "$out" | awk -F: -v c="$cluster" 'index($0, c) && $3 ~ /^[0-9]+$/ { print $3; exit }')
+    if [[ -n "$scsi" ]]; then
+        printf '%s\n' "$scsi"
+        return 0
+    fi
+    if [[ "$status" -ne 0 && ( "$out" == *"does not exist"* || "$out" == *CMMVC5753E* || "$out" == *CMMVC5754E* ) ]]; then
+        log_error "  lsvdiskhostmap ${vdisk} failed: ${out}"
+        return 2
+    fi
+    return 1
+}
+
+ibm_svctask() {
+    local message="$1"
+    shift
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would run: svctask $*"
+        return 0
+    fi
+    local out status=0 line
+    out=$(storage_ssh ibm "svctask $*" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  ${message}"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log "    ${line}"
+        done <<< "$out"
+        return 1
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log "    ${line}"
+    done <<< "$out"
+    return 0
+}
+
+# Prints one member of this host cluster. Returns 1 when it has none, 2 on query failure.
+ibm_one_cluster_member() {
+    local cluster="$1"
+    local names="" status=0 line name detail hc dstatus
+    names=$(storage_ssh --read ibm "svcinfo lshost -nohdr -delim :" 2>&1) || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        log_error "  lshost list failed while looking for members of ${cluster}: ${names}"
+        return 2
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name=$(printf '%s\n' "$line" | awk -F: '{ print $2 }')
+        [[ -z "$name" || "$name" == "name" ]] && continue
+        dstatus=0
+        detail=$(ibm_lshost "$name") || dstatus=$?
+        if [[ "$dstatus" -eq 1 ]]; then
+            return 2
+        fi
+        if [[ "$dstatus" -ne 0 ]]; then
             continue
         fi
-        free=$(ibm_lowest_free_scsi "$planned") || {
-            log_error "  No free SCSI id on ${host_name}"
+        hc=$(printf '%s\n' "$detail" | ibm_lshost_field host_cluster_name)
+        if [[ "$hc" == "$cluster" ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done <<< "$names"
+    return 1
+}
+
+ibm_unmap_cloud_vdisks() {
+    local host="$1"
+    local cloud_name="$2"
+    local rows="" sid vname
+    rows=$(ibm_vdisk_rows "$host") || return 1
+    while read -r sid vname; do
+        [[ -z "$vname" ]] && continue
+        if [[ ! "$vname" =~ ^${cloud_name}_iscsi_lta_ibm_vdisk[0-9]{2}$ ]]; then
+            continue
+        fi
+        ibm_svctask "Failed to remove private map of ${vname} from ${host}" \
+            "rmvdiskhostmap -host ${host} ${vname}" || return 1
+        if [[ "$DRY_RUN" != "true" ]]; then
+            log "  Removed private map of ${vname} from ${host}"
+        fi
+    done <<< "$rows"
+}
+
+# Map this cloud's vdisks once to ${cloud}_iscsi_hc and add unclustered hosts.
+# empty_ref / cloud_ref / ours_ref are namerefs to host-name arrays.
+ibm_share_vdisks() {
+    local cloud_name="$1"
+    local -n empty_ref=$2
+    local -n cloud_ref=$3
+    local -n ours_ref=$4
+    local hc="${cloud_name}_iscsi_hc"
+    local i vdisk scsi=0 joined h
+
+    if [[ "$DRY_RUN" == "true" && "$TARGET_TYPE" != "vmware" ]]; then
+        log "[DRY-RUN] Would create: svctask mkhostcluster -name ${hc}"
+        local -a preview=()
+        if (( ${#empty_ref[@]} > 0 )); then
+            preview+=("${empty_ref[@]}")
+        fi
+        if (( ${#cloud_ref[@]} > 0 )); then
+            preview+=("${cloud_ref[@]}")
+        fi
+        if (( ${#preview[@]} > 0 )); then
+            joined=$(IFS=:; printf '%s' "${preview[*]}")
+            log "[DRY-RUN] Would add: svctask addhostclustermember -host ${joined} ${hc}"
+        fi
+        for (( i=1; i<=LUN_COUNT; i++ )); do
+            vdisk=$(printf '%s_iscsi_lta_ibm_vdisk%02d' "$cloud_name" "$i")
+            log "[DRY-RUN] Would map: svctask mkvdiskhostmap -hostcluster ${hc} -scsi ${scsi} ${vdisk}"
+            scsi=$((scsi + 1))
+        done
+        return 0
+    fi
+
+    local exists=0
+    ibm_hostcluster_exists "$hc" || exists=$?
+    if [[ "$exists" -eq 2 ]]; then
+        return 1
+    fi
+
+    local seed=""
+    local -a unmap=() add=()
+    if [[ "$exists" -eq 1 && ${#cloud_ref[@]} -gt 0 ]]; then
+        seed="${cloud_ref[0]}"
+        if (( ${#cloud_ref[@]} > 1 )); then
+            unmap+=("${cloud_ref[@]:1}")
+        fi
+    elif (( ${#cloud_ref[@]} > 0 )); then
+        unmap+=("${cloud_ref[@]}")
+    fi
+    if (( ${#empty_ref[@]} > 0 )); then
+        add+=("${empty_ref[@]}")
+    fi
+
+    if [[ "$exists" -eq 1 ]]; then
+        if [[ -n "$seed" ]]; then
+            ibm_svctask "Failed to create host cluster ${hc} from ${seed}" \
+                "mkhostcluster -name ${hc} -seedfromhost ${seed}" || return 1
+            if [[ "$DRY_RUN" != "true" ]]; then
+                log_success "  Host cluster ${hc} created from ${seed}"
+            fi
+        else
+            ibm_svctask "Failed to create host cluster ${hc}" \
+                "mkhostcluster -name ${hc}" || return 1
+            if [[ "$DRY_RUN" != "true" ]]; then
+                log_success "  Host cluster ${hc} created"
+            fi
+        fi
+    else
+        log_success "  Host cluster ${hc} already exists"
+    fi
+
+    if (( ${#unmap[@]} > 0 )); then
+        for h in "${unmap[@]}"; do
+            ibm_unmap_cloud_vdisks "$h" "$cloud_name" || return 1
+            add+=("$h")
+        done
+    fi
+
+    if (( ${#add[@]} > 0 )); then
+        joined=$(IFS=:; printf '%s' "${add[*]}")
+        ibm_svctask "Failed to add ${joined} to host cluster ${hc}" \
+            "addhostclustermember -host ${joined} ${hc}" || return 1
+        if [[ "$DRY_RUN" != "true" ]]; then
+            log_success "  Added ${joined} to host cluster ${hc}"
+        fi
+    fi
+
+    local occupied="" rows="" sid vname map_scsi=0 member="" member_status=0
+    declare -A seed_scsi=()
+    if [[ -n "$seed" ]]; then
+        rows=$(ibm_vdisk_rows "$seed") || return 1
+        while read -r sid vname; do
+            [[ -z "$sid" ]] && continue
+            occupied+=" ${sid}"
+            seed_scsi["$vname"]="$sid"
+        done <<< "$rows"
+    elif (( ${#ours_ref[@]} > 0 )); then
+        rows=$(ibm_vdisk_rows "${ours_ref[0]}") || return 1
+        while read -r sid vname; do
+            [[ -z "$sid" ]] && continue
+            occupied+=" ${sid}"
+        done <<< "$rows"
+    elif [[ "$exists" -eq 0 ]]; then
+        member=$(ibm_one_cluster_member "$hc") || member_status=$?
+        if [[ "$member_status" -eq 2 ]]; then
+            return 1
+        fi
+        if [[ -n "$member" ]]; then
+            rows=$(ibm_vdisk_rows "$member") || return 1
+            while read -r sid vname; do
+                [[ -z "$sid" ]] && continue
+                occupied+=" ${sid}"
+            done <<< "$rows"
+        fi
+    fi
+
+    for (( i=1; i<=LUN_COUNT; i++ )); do
+        vdisk=$(printf '%s_iscsi_lta_ibm_vdisk%02d' "$cloud_name" "$i")
+        map_scsi=0
+        scsi=$(ibm_cluster_map_scsi "$vdisk" "$hc") || map_scsi=$?
+        if [[ "$map_scsi" -eq 2 ]]; then
+            return 1
+        fi
+        if [[ "$map_scsi" -eq 0 ]]; then
+            if [[ " ${occupied} " != *" ${scsi} "* ]]; then
+                occupied+=" ${scsi}"
+            fi
+            log_success "  vdisk ${vdisk} already mapped to host cluster ${hc}"
+            continue
+        fi
+        if [[ -n "${seed_scsi[$vdisk]:-}" ]]; then
+            log "  vdisk ${vdisk} stays on SCSI ${seed_scsi[$vdisk]} through seed host ${seed}"
+            continue
+        fi
+        scsi=$(ibm_lowest_free_scsi "$occupied") || {
+            log_error "  No free SCSI id on host cluster ${hc}"
             return 1
         }
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -scsi ${free} ${vdisk}"
-        else
-            if ! storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -scsi ${free} ${vdisk}"; then
-                log_error "  Failed to map ${vdisk} to ${host_name}; existing maps were left in place"
-                return 1
-            fi
-            log_success "  vdisk ${vdisk} mapped to ${host_name} (scsi ${free})"
+        ibm_svctask "Failed to map ${vdisk} to host cluster ${hc}" \
+            "mkvdiskhostmap -hostcluster ${hc} -scsi ${scsi} ${vdisk}" || return 1
+        if [[ "$DRY_RUN" != "true" ]]; then
+            log_success "  vdisk ${vdisk} mapped to host cluster ${hc} (scsi ${scsi})"
         fi
-        planned+=" ${free}"
-        log "  Lowest free SCSI id used for ${vdisk} on ${host_name} is ${free}"
+        occupied+=" ${scsi}"
+        log "  Lowest free SCSI id used for ${vdisk} on ${hc} is ${scsi}"
     done
 }
 
@@ -3150,15 +3417,39 @@ ibm_bind_hosts() {
         fi
     fi
 
-    local failed=0 pair worker_name iqn
+    local failed=0 pair worker_name iqn line="" status=0 tag="" a="" b=""
+    local -a empty_hosts=() cloud_hosts=() ours_hosts=()
     for pair in "${iqn_pairs[@]}"; do
         [[ -z "$pair" ]] && continue
         worker_name="${pair%%:*}"
         iqn="${pair#*:}"
-        if ! ibm_bind_one_host "$cloud_name" "$portset_name" "$worker_name" "$iqn"; then
+        line=""
+        status=0
+        line=$(ibm_bind_one_host "$cloud_name" "$portset_name" "$worker_name" "$iqn") || status=$?
+        if [[ -z "$line" ]]; then
+            failed=1
+            continue
+        fi
+        read -r tag a b <<< "$line"
+        case "$tag" in
+            ours) ours_hosts+=("$a") ;;
+            none)
+                if [[ "$a" == "cloud" ]]; then
+                    cloud_hosts+=("$b")
+                elif [[ "$a" == "empty" ]]; then
+                    empty_hosts+=("$b")
+                fi
+                ;;
+            foreign|blocked) [[ "$status" -ne 0 ]] && failed=1 ;;
+        esac
+        if [[ "$status" -ne 0 && "$tag" != "foreign" && "$tag" != "blocked" ]]; then
             failed=1
         fi
     done
+
+    if (( ${#empty_hosts[@]} + ${#cloud_hosts[@]} + ${#ours_hosts[@]} > 0 )); then
+        ibm_share_vdisks "$cloud_name" empty_hosts cloud_hosts ours_hosts || failed=1
+    fi
     if [[ "$failed" -ne 0 ]]; then
         return 1
     fi
@@ -3339,7 +3630,7 @@ storage_setup_ibm() {
 
     # --- Sub-stages C and D: adopt the host that already owns the IQN, then map ---
     log "  [C] Resolving host objects by IQN..."
-    log "  [D] Mapping vdisk(s) at a free SCSI id..."
+    log "  [D] Mapping vdisk(s) to host cluster ${cloud_name}_iscsi_hc..."
     local bind_status=0
     ibm_bind_hosts "$cloud_name" "$portset_name" "${iqn_pairs[@]}" || bind_status=$?
 
