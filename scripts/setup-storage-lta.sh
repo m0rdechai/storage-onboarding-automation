@@ -2056,8 +2056,8 @@ collect_worker_iqns() {
             fi
         done
     elif [[ "$TARGET_TYPE" == "vmware" ]]; then
-        # This loop stays in the current shell. The QUADS arm below is a
-        # pipeline, and ESXi has no /etc/iscsi/initiatorname.iscsi to SSH.
+        # This loop stays in the current shell. ESXi has no
+        # /etc/iscsi/initiatorname.iscsi to SSH.
         vmware_preflight || return 1
         local hosts_out="" sel_status=0
         hosts_out=$(vmware_selected_hosts) || sel_status=$?
@@ -2097,7 +2097,7 @@ collect_worker_iqns() {
     else
         local json
         json=$(quads_query_hosts) || return 1
-        parse_hosts "$json" | while read -r hostname model; do
+        while read -r hostname model; do
             if [[ -n "$EXCLUDE_HOSTS" ]]; then
                 local skip=false
                 for excl in $EXCLUDE_HOSTS; do
@@ -2115,7 +2115,7 @@ collect_worker_iqns() {
             else
                 log_warn "  ${worker}: no valid IQN found"
             fi
-        done
+        done < <(parse_hosts "$json")
     fi
 
     # Guard: printf '%s\n' with an empty array still emits one blank line,
@@ -2759,6 +2759,19 @@ storage_setup_pure() {
         local member_cmd="purehgroup setattr --addhostlist ${host_name} ${hg_name}"
         if [[ "$DRY_RUN" == "true" ]]; then
             log "[DRY-RUN] Would run: ${member_cmd}"
+            continue
+        fi
+
+        local host_out="" host_rc=0
+        host_out=$(storage_ssh pure "purehost list ${host_name}" 2>&1) || host_rc=$?
+        if [[ "$host_rc" -ne 0 || "$host_out" != *"$iqn"* ]]; then
+            if [[ "$host_rc" -ne 0 ]]; then
+                log_warn "  Failed to read IQN for Pure host ${host_name}; leaving that host unchanged"
+                pure_log_lines "$host_out"
+            else
+                log_warn "  Pure host ${host_name} does not have IQN ${iqn}; leaving that host unchanged"
+            fi
+            pure_failed=1
             continue
         fi
 
@@ -3969,7 +3982,8 @@ vmware_portals_logged_in() {
 # Dry-run logs the add and rediscover commands and does not run them.
 # Rediscover holds this host's iSCSI command path until ESXi finishes.
 # The client waits VMWARE_REDISCOVER_TIMEOUT seconds. If that client times
-# out, poll iscsi adapter get and then read the session list once.
+# out, poll iscsi adapter get. Once the adapter answers, poll the session
+# list for 60 seconds, the same wait used when rediscover returns.
 # logged_in on every portal is success. A host whose adapter does not
 # answer is not rediscovered. This function rediscovers a host at most
 # once and returns 1 on failure. The caller keeps going.
@@ -4031,7 +4045,7 @@ vmware_discover_host() {
             continue
         fi
         if [[ -n "$add_out" ]]; then
-            log "    ${add_out}"
+            log "    $(printf '%s\n' "$add_out" | vmware_redact)"
         fi
         local again
         again=$(vmware_iscsi_timeout "$VMWARE_SENDTARGET_LIST_TIMEOUT" "$ipath" iscsi adapter discovery sendtarget list -A "$adapter" 2>&1 || true)
@@ -4050,11 +4064,11 @@ vmware_discover_host() {
     local rd_out="" rd_status=0 rd_line
     rd_out=$(vmware_esxcli_bounded "$VMWARE_REDISCOVER_TIMEOUT" "$ipath" iscsi adapter discovery rediscover -A "$adapter" 2>&1) || rd_status=$?
     while IFS= read -r rd_line; do
-        [[ -n "$rd_line" ]] && log "    ${rd_line}"
+        [[ -n "$rd_line" ]] && log "    $(printf '%s\n' "$rd_line" | vmware_redact)"
     done <<< "$rd_out"
     if [[ "$rd_status" -eq 124 ]]; then
         log_warn "  ${ipath}: rediscover did not return within ${VMWARE_REDISCOVER_TIMEOUT}s; waiting for the iSCSI adapter"
-        local poll_start=$SECONDS ready=0 poll_status sessions="" sess_status
+        local poll_start=$SECONDS ready=0 poll_status
         while (( SECONDS - poll_start < VMWARE_ADAPTER_POLL_WINDOW )); do
             poll_status=0
             vmware_iscsi_timeout "$VMWARE_ADAPTER_GET_TIMEOUT" "$ipath" iscsi adapter get -A "$adapter" >/dev/null 2>&1 || poll_status=$?
@@ -4071,16 +4085,7 @@ vmware_discover_host() {
             log_error "  ${ipath}: iscsi adapter get did not return after rediscover; not reading sessions"
             return 1
         fi
-        sess_status=0
-        sessions=$(vmware_iscsi_timeout "$VMWARE_SESSION_LIST_TIMEOUT" "$ipath" iscsi session connection list 2>&1) || sess_status=$?
-        if [[ "$sess_status" -eq 0 ]] && vmware_portals_logged_in "$sessions" "${addrs[@]}"; then
-            log_success "  ${ipath}: logged_in to ${addrs[*]}"
-            return 0
-        fi
-        log_error "  ${ipath}: rediscover client timed out and sessions are not logged_in"
-        return 1
-    fi
-    if [[ "$rd_status" -ne 0 ]]; then
+    elif [[ "$rd_status" -ne 0 ]]; then
         log_error "  ${ipath}: rediscover failed"
         return 1
     fi
