@@ -2017,7 +2017,7 @@ storage_apply() {
     shift 2
     local out status=0 line
     out=$(storage_ssh "$vendor" "$@" 2>&1) || status=$?
-    out=${out//$'\r'/$'\n'}
+    out=${out//$'\r'/}
     if [[ "$status" -ne 0 ]]; then
         log_error "  ${message}"
         while IFS= read -r line; do
@@ -2026,8 +2026,11 @@ storage_apply() {
         return 1
     fi
     while IFS= read -r line; do
-        [[ -n "$line" ]] && log "    ${line}"
+        if [[ -n "$line" ]]; then
+            log "    ${line}"
+        fi
     done <<< "$out"
+    return 0
 }
 
 # =============================================================================
