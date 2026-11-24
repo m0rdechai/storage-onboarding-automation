@@ -4266,13 +4266,20 @@ storage_discovery_and_verify() {
                 netapp-aff) vendor_pattern="NETAPP,LUN" ;;
             esac
 
-            local path_count
-            path_count=$(echo "$mpath_out" | grep -c "${vendor_pattern}" 2>/dev/null || true)
-            local lun_count
-            lun_count=$(echo "$mpath_out" | grep -cP "^[0-9a-f].*${vendor_pattern}" 2>/dev/null || true)
+            # Count either header shape: a raw WWID, or an mpath alias
+            # with the WWID in parentheses. Path lines are the H:C:T:L rows
+            # under that device, until the next header.
+            local lun_count path_count
+            read -r lun_count path_count < <(awk -v pat="$vendor_pattern" '
+                function header(line) { return line ~ "^[^[:space:]].* dm-[0-9]+ " }
+                header($0) && $0 ~ pat { luns++; current = 1; next }
+                header($0) { current = 0; next }
+                current && $0 ~ /[0-9]+:[0-9]+:[0-9]+:[0-9]+/ { paths++ }
+                END { print luns + 0, paths + 0 }
+            ' <<< "$mpath_out")
 
             local status="OK"
-            if [[ "$path_count" -eq 0 ]]; then
+            if [[ "$lun_count" -eq 0 || "$path_count" -eq 0 ]]; then
                 status="NO_PATHS"
             fi
 
